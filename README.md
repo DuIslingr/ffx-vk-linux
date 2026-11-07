@@ -11,7 +11,9 @@ library is that: a small PE loader that maps the DLL, resolves its imports to Li
 stand-ins, thunks every function pointer crossing the boundary, and exposes AMD's FSR API
 (`ffxCreateContext`, `ffxDispatch`, ... - `third_party/ffx/include`) to Linux code.
 
-**Status: in progress.** Not usable yet.
+**Status: in progress.** AMD's DLLs load and run natively (tools/ffxquery: versions listed, an upscale
+context created) - on Mesa RADV the SDK offers FSR 3.1.6 and 2.3.4, not FSR 4.1.2 yet: it asks for
+`vkUpdateFfxApiProviderAMD`, a hook of AMD's Windows driver. `FFXVK_DEBUG=1` logs what it loads and asks for.
 
 ## What you need
 

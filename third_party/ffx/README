@@ -1,3 +1,3 @@
 AMD FSR SDK v2.4.0's public API headers (github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK,
-Kits/FidelityFX/api/include and upscalers/include), unmodified: MIT, each file's header.
+Kits/FidelityFX/api/include and upscalers/include - the same layout here, their includes relative), unmodified: MIT, each file's header.
 The signed DLLs themselves are not here (AMD's binary-only licence).
