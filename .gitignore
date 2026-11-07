@@ -1,0 +1,4 @@
+# AMD's signed binaries are never committed: their licence allows redistribution in binary form
+# only, under AMD's terms - each user supplies their own copy
+*.dll
+/build*/
