@@ -7,6 +7,9 @@
 #include "pe.h"
 #include "teb.h"
 #include "vk_thunks.h"
+#include "win32_runtime.h"
+#include "win32_security.h"
+#include "adapter.h"
 
 #include <linux/futex.h>
 #include <sys/syscall.h>
@@ -115,6 +118,15 @@ void* loadLibrary(const std::string& asked) {
     const std::string name = lower(fileName(asked));
     if (PeImage* img = imageNamed(name)) return img->base;
     if (auto it = systemModules().find(name); it != systemModules().end()) return it->second;
+    if (std::filesystem::path(asked).is_absolute()) {
+        std::string err;
+        PeImage* img = loadPe(asked, resolveImport, &err);
+        if (!img || !runInit(*img, &err)) {
+            std::fprintf(stderr, "ffx-vk-linux: %s\n", err.c_str());
+            return nullptr;
+        }
+        return img->base;
+    }
     // one of AMD's beside the first: loaded the same way
     std::error_code ec;
     for (const auto& e : std::filesystem::directory_iterator(dllDirectory, ec))
@@ -143,6 +155,9 @@ WINAPI void* k_GetModuleHandleA(const char* n) {
     if (PeImage* img = imageNamed(n)) return img->base;
     auto it = systemModules().find(lower(fileName(n)));
     return it == systemModules().end() ? nullptr : it->second;
+}
+WINAPI void* k_GetModuleHandleW(const char16_t* n) {
+    return k_GetModuleHandleA(n ? utf16ToUtf8(n).c_str() : nullptr);
 }
 WINAPI int k_GetModuleHandleExW(uint32_t flags, const void* what, void** out) {
     void* h = nullptr;
@@ -318,6 +333,31 @@ WINAPI void* c_memset(void* d, int v, size_t n) { return std::memset(d, v, n); }
 WINAPI int c_memcmp(const void* a, const void* b, size_t n) { return std::memcmp(a, b, n); }
 WINAPI size_t c_strlen(const char* s) { return std::strlen(s); }
 WINAPI int c_strcmp(const char* a, const char* b) { return std::strcmp(a, b); }
+WINAPI size_t c_wcsnlen(const char16_t* s, size_t n) {
+    size_t i = 0;
+    while (i < n && s[i]) ++i;
+    return i;
+}
+WINAPI int c_wcsncmp(const char16_t* a, const char16_t* b, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
+        if (!a[i]) break;
+    }
+    return 0;
+}
+WINAPI char* c_getenv(const char* n) { return std::getenv(n); }
+WINAPI int c_wgetenv_s(size_t* required, char16_t* out, size_t capacity, const char16_t* name) {
+    const char* value = std::getenv(utf16ToUtf8(name).c_str());
+    const std::u16string wide = value ? utf8ToUtf16(value) : std::u16string{};
+    if (required) *required = value ? wide.size() + 1 : 0;
+    if (!out) return capacity ? EINVAL : 0;
+    if (!capacity) return ERANGE;
+    out[0] = 0;
+    if (!value) return 0;
+    if (capacity <= wide.size()) return ERANGE;
+    std::memcpy(out, wide.c_str(), (wide.size() + 1) * sizeof(char16_t));
+    return 0;
+}
 WINAPI int c_strncpy_s(char* d, size_t size, const char* s, size_t n) {
     if (!d || !size) return EINVAL;
     const size_t len = std::min(n == size_t(-1) ? std::strlen(s) : strnlen(s, n), size - 1);
@@ -401,6 +441,8 @@ WINAPI float m_powf(float a, float b) { return std::pow(a, b); }
 WINAPI float m_roundf(float x) { return std::round(x); }
 WINAPI float m_log2f(float x) { return std::log2(x); }
 WINAPI float m_exp2f(float x) { return std::exp2(x); }
+WINAPI double m_sqrt(double x) { return std::sqrt(x); }
+WINAPI float m_sqrtf(float x) { return std::sqrt(x); }
 short classOf(int c) { return c == FP_INFINITE ? 1 : c == FP_NAN ? 2 : c == FP_NORMAL ? -1 : c == FP_SUBNORMAL ? -2 : 0; } // (MSVC's)
 WINAPI short m_dclass(double x) { return classOf(std::fpclassify(x)); }
 WINAPI short m_fdclass(float x) { return classOf(std::fpclassify(x)); }
@@ -530,6 +572,7 @@ const std::map<std::string, void*>& table() {
         F("kernel32.dll", "LoadLibraryA", k_LoadLibraryA), F("kernel32.dll", "LoadLibraryExA", k_LoadLibraryExA),
         F("kernel32.dll", "LoadLibraryExW", k_LoadLibraryExW), F("kernel32.dll", "FreeLibrary", k_FreeLibrary),
         F("kernel32.dll", "GetModuleHandleA", k_GetModuleHandleA), F("kernel32.dll", "GetModuleHandleExW", k_GetModuleHandleExW),
+        F("kernel32.dll", "GetModuleHandleW", k_GetModuleHandleW),
         F("kernel32.dll", "GetModuleFileNameA", k_GetModuleFileNameA), F("kernel32.dll", "GetModuleFileNameW", k_GetModuleFileNameW),
         F("kernel32.dll", "GetProcAddress", k_GetProcAddress), F("kernel32.dll", "DisableThreadLibraryCalls", k_DisableThreadLibraryCalls),
         F("kernel32.dll", "GetLastError", k_GetLastError), F("kernel32.dll", "GetCurrentThreadId", k_GetCurrentThreadId),
@@ -557,6 +600,8 @@ const std::map<std::string, void*>& table() {
         F("vcruntime140.dll", "memcpy", c_memcpy), F("vcruntime140.dll", "memmove", c_memmove), F("vcruntime140.dll", "memset", c_memset),
         F("vcruntime140.dll", "memcmp", c_memcmp), F("api-ms-win-crt-string-l1-1-0.dll", "strlen", c_strlen),
         F("api-ms-win-crt-string-l1-1-0.dll", "strcmp", c_strcmp), F("api-ms-win-crt-string-l1-1-0.dll", "strncpy_s", c_strncpy_s),
+        F("api-ms-win-crt-string-l1-1-0.dll", "wcsnlen", c_wcsnlen), F("api-ms-win-crt-string-l1-1-0.dll", "wcsncmp", c_wcsncmp),
+        F("api-ms-win-crt-environment-l1-1-0.dll", "getenv", c_getenv), F("api-ms-win-crt-environment-l1-1-0.dll", "_wgetenv_s", c_wgetenv_s),
         F("api-ms-win-crt-string-l1-1-0.dll", "wcscpy_s", c_wcscpy_s), F("api-ms-win-crt-environment-l1-1-0.dll", "getenv_s", c_getenv_s),
         F("api-ms-win-crt-locale-l1-1-0.dll", "___lc_codepage_func", c_lc_codepage),
         F("api-ms-win-crt-runtime-l1-1-0.dll", "_initterm", c_initterm), F("api-ms-win-crt-runtime-l1-1-0.dll", "_initterm_e", c_initterm_e),
@@ -569,6 +614,8 @@ const std::map<std::string, void*>& table() {
         F("api-ms-win-crt-runtime-l1-1-0.dll", "_seh_filter_dll", c_seh_filter_dll),
         F("api-ms-win-crt-runtime-l1-1-0.dll", "_invoke_watson", c_invoke_watson),
         F("api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vsprintf", c_stdio_common_vsprintf),
+        F("api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vsprintf_s", c_stdio_common_vsprintf),
+        F("api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vswprintf", c_stdio_common_vswprintf_s),
         F("api-ms-win-crt-stdio-l1-1-0.dll", "__stdio_common_vswprintf_s", c_stdio_common_vswprintf_s),
         F("vcruntime140.dll", "_CxxThrowException", c_CxxThrowException), F("vcruntime140.dll", "__C_specific_handler", c_frame_handler),
         F("vcruntime140_1.dll", "__CxxFrameHandler4", c_frame_handler), F("vcruntime140.dll", "__std_terminate", c_std_terminate),
@@ -581,6 +628,7 @@ const std::map<std::string, void*>& table() {
         F("api-ms-win-crt-math-l1-1-0.dll", "atanf", m_atanf), F("api-ms-win-crt-math-l1-1-0.dll", "powf", m_powf),
         F("api-ms-win-crt-math-l1-1-0.dll", "roundf", m_roundf), F("api-ms-win-crt-math-l1-1-0.dll", "log2f", m_log2f),
         F("api-ms-win-crt-math-l1-1-0.dll", "exp2f", m_exp2f), F("api-ms-win-crt-math-l1-1-0.dll", "_dclass", m_dclass),
+        F("api-ms-win-crt-math-l1-1-0.dll", "sqrt", m_sqrt), F("api-ms-win-crt-math-l1-1-0.dll", "sqrtf", m_sqrtf),
         F("api-ms-win-crt-math-l1-1-0.dll", "_fdclass", m_fdclass), F("api-ms-win-crt-math-l1-1-0.dll", "_ldclass", m_ldclass),
         F("api-ms-win-crt-math-l1-1-0.dll", "_dsign", m_dsign), F("api-ms-win-crt-math-l1-1-0.dll", "_fdsign", m_fdsign),
         F("api-ms-win-crt-math-l1-1-0.dll", "_ldsign", m_ldsign),
@@ -600,6 +648,9 @@ const std::map<std::string, void*>& table() {
 } // namespace
 
 void* standIn(const std::string& dll, const std::string& name) {
+    if (void* p = adapterStandIn(dll, name)) return p;
+    if (void* p = runtimeStandIn(dll, name)) return p;
+    if (void* p = securityStandIn(dll, name)) return p;
     const auto& t = table();
     if (auto it = t.find(dll + "!" + name); it != t.end()) return it->second;
     return nullptr;
@@ -619,7 +670,7 @@ void* resolveImport(const std::string& dll, const std::string& name) {
 
 void setDllDirectory(const std::string& dir) {
     dllDirectory = dir;
-    for (const char* n : {"kernel32.dll", "version.dll", "vulkan-1.dll", "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"})
+    for (const char* n : {"kernel32.dll", "version.dll", "vulkan-1.dll", "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll", "gdi32.dll"})
         if (!systemModules().count(n)) systemModules()[n] = new SystemModule{n};
 }
 

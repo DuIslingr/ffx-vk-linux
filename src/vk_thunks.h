@@ -15,4 +15,8 @@ PFN_vkVoidFunction msGetDeviceProcAddrFor(PFN_vkGetDeviceProcAddr real);
 // a vkGetInstanceProcAddr the same way
 PFN_vkVoidFunction msGetInstanceProcAddrFor(PFN_vkGetInstanceProcAddr real);
 
+// Optional driver provider: UpdateFfxApiProvider, with the Microsoft x64 ABI.
+// The SDK's private Vulkan entry additionally takes the VkDevice as its first argument.
+void setDriverProvider(void* update);
+
 } // namespace ffxvk

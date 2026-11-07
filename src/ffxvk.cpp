@@ -146,6 +146,23 @@ int ffxvkLoad(const char* directory) {
         entries = {};
         return error = img->path + " doesn't export AMD's FSR API", 3;
     }
+    // Keep the SDK in charge of provider enumeration, support checks and context routing.
+    // The optional Windows driver component supplies FSR 4 through the SDK's own hook.
+    const char* driverPath = std::getenv("FFXVK_DRIVER_DLL");
+    std::filesystem::path driver = driverPath ? std::filesystem::path(driverPath)
+                                            : std::filesystem::path(directory) / "amdvkffx64.dll";
+    std::error_code ec;
+    if (driverPath || std::filesystem::exists(driver, ec)) {
+        void* module = ffxvk::loadDll(std::filesystem::absolute(driver).string());
+        void* update = nullptr;
+        for (auto* image : ffxvk::loadedImages())
+            if (image->base == module) update = image->exportOf("UpdateFfxApiProvider");
+        if (!update) {
+            entries = {};
+            return error = "cannot load the driver provider from " + driver.string(), 4;
+        }
+        ffxvk::setDriverProvider(update);
+    }
     return 0;
 }
 
