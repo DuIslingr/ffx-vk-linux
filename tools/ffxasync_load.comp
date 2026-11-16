@@ -1,0 +1,14 @@
+#version 450
+// ffxasync's stand-in for a game's rendering: per pixel of the render-resolution colour image, `iterations` rounds of
+// arithmetic on what is there, written back (the colour FSR then reads). Its cost grows with `iterations`.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, rgba16f) uniform image2D colour;
+layout(push_constant) uniform Push { uint iterations; } push;
+
+void main() {
+    const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(at, imageSize(colour)))) return;
+    vec4 v = imageLoad(colour, at) + vec4(at.xyxy) * 1e-4;
+    for (uint i = 0; i < push.iterations; ++i) v = fract(sin(v * 1.618 + 0.25) * 43.758);
+    imageStore(colour, at, v);
+}

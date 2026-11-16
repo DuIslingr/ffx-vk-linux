@@ -37,6 +37,22 @@ add_executable(peinfo tools/peinfo.cpp)
 add_executable(ffxquery tools/ffxquery.cpp tools/upscale_smoke.cpp)
 target_link_libraries(ffxquery PRIVATE ffx_vk_linux Vulkan::Vulkan)
 
+# ffxasync: FSR on a compute-only queue against the graphics queue (needs glslc for its load shader)
+find_program(GLSLC glslc)
+if(GLSLC)
+    add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/ffxasync_load.inc
+        COMMAND ${GLSLC} --target-env=vulkan1.2 -O -mfmt=num -o ${CMAKE_CURRENT_BINARY_DIR}/ffxasync_load.inc ${CMAKE_CURRENT_SOURCE_DIR}/tools/ffxasync_load.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/ffxasync_load.comp
+        COMMENT "ffxasync's load shader")
+    add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/ffxasync_raster.inc
+        COMMAND ${GLSLC} --target-env=vulkan1.2 -O -mfmt=num -o ${CMAKE_CURRENT_BINARY_DIR}/ffxasync_raster.inc ${CMAKE_CURRENT_SOURCE_DIR}/tools/ffxasync_raster.vert
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/ffxasync_raster.vert
+        COMMENT "ffxasync's raster load shader")
+    add_executable(ffxasync tools/ffxasync.cpp ${CMAKE_CURRENT_BINARY_DIR}/ffxasync_load.inc ${CMAKE_CURRENT_BINARY_DIR}/ffxasync_raster.inc)
+    target_include_directories(ffxasync PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    target_link_libraries(ffxasync PRIVATE ffx_vk_linux Vulkan::Vulkan)
+endif()
+
 include(CTest)
 if(BUILD_TESTING)
     add_executable(runtime_checks tests/win32_runtime.cpp src/win32_runtime.cpp src/teb.cpp)

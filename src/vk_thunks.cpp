@@ -187,6 +187,42 @@ __attribute__((ms_abi)) VkResult msCreateComputePipelines(VkDevice device, VkPip
     return r_vkCreateComputePipelines(device, cache, n, copy.data(), allocator, out);
 }
 
+// ---- On a compute-only queue (FSR run asynchronously) ---------------------------------------------------------------
+// FSR's passes are compute; on a compute-only queue family (FFX records into whatever command buffer the program gives
+// it) the output is the same - the probe's --compute-queue. One barrier per context, on its first use, names graphics
+// stages: AMD's backend moves its own new images to COLOR_ATTACHMENT_OPTIMAL with COLOR_ATTACHMENT_OUTPUT in its stage
+// masks, which a compute queue's command buffer may not hold. Graphics-only stages become ALL_COMMANDS and graphics-only
+// access bits MEMORY_READ / MEMORY_WRITE - a superset, valid on every queue: on a graphics queue only more conservative.
+constexpr VkPipelineStageFlags kGraphicsStages = VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+    VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT | VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT |
+    VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+    VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+constexpr VkAccessFlags kGraphicsReads = VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INPUT_ATTACHMENT_READ_BIT |
+    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+constexpr VkAccessFlags kGraphicsWrites = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+VkPipelineStageFlags anyQueueStages(VkPipelineStageFlags s) {
+    return (s & kGraphicsStages) ? (s & ~kGraphicsStages) | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : s;
+}
+VkAccessFlags anyQueueAccess(VkAccessFlags a) {
+    if (a & kGraphicsReads) a = (a & ~kGraphicsReads) | VK_ACCESS_MEMORY_READ_BIT;
+    if (a & kGraphicsWrites) a = (a & ~kGraphicsWrites) | VK_ACCESS_MEMORY_WRITE_BIT;
+    return a;
+}
+
+__attribute__((ms_abi)) void msCmdPipelineBarrier(VkCommandBuffer cmd, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags dep,
+        uint32_t nm, const VkMemoryBarrier* m, uint32_t nb, const VkBufferMemoryBarrier* b, uint32_t ni, const VkImageMemoryBarrier* im) {
+    if (!((src | dst) & kGraphicsStages)) return r_vkCmdPipelineBarrier(cmd, src, dst, dep, nm, m, nb, b, ni, im);
+    std::vector<VkMemoryBarrier> mm(m, m + nm);
+    std::vector<VkBufferMemoryBarrier> bb(b, b + nb);
+    std::vector<VkImageMemoryBarrier> ii(im, im + ni);
+    for (auto& x : mm) x.srcAccessMask = anyQueueAccess(x.srcAccessMask), x.dstAccessMask = anyQueueAccess(x.dstAccessMask);
+    for (auto& x : bb) x.srcAccessMask = anyQueueAccess(x.srcAccessMask), x.dstAccessMask = anyQueueAccess(x.dstAccessMask);
+    for (auto& x : ii) x.srcAccessMask = anyQueueAccess(x.srcAccessMask), x.dstAccessMask = anyQueueAccess(x.dstAccessMask);
+    if (verbose()) std::fprintf(stderr, "ffx-vk-linux: barrier stages 0x%x->0x%x: graphics stages as ALL_COMMANDS\n", src, dst);
+    r_vkCmdPipelineBarrier(cmd, anyQueueStages(src), anyQueueStages(dst), dep, nm, mm.data(), nb, bb.data(), ni, ii.data());
+}
+
 __attribute__((ms_abi)) VkResult msCreateShaderModule(VkDevice device,
         const VkShaderModuleCreateInfo* info, const VkAllocationCallbacks* allocator, VkShaderModule* out) {
     if (!info || !info->pCode || info->codeSize % sizeof(uint32_t)) return VK_ERROR_INVALID_SHADER_NV;
@@ -231,6 +267,7 @@ PFN_vkVoidFunction special(const char* name) {
         return reinterpret_cast<PFN_vkVoidFunction>(&msMemoryProperties2);
     if (std::strcmp(name, "vkAllocateMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&msAllocateMemory);
     if (std::strcmp(name, "vkCreateComputePipelines") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&msCreateComputePipelines);
+    if (std::strcmp(name, "vkCmdPipelineBarrier") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&msCmdPipelineBarrier);
     return nullptr;
 }
 

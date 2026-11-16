@@ -123,6 +123,43 @@ the "before" rows: the changes, not the bridge, close the gap. The D3D12 FSR 4 i
 the SDK's 4.1.1, not the driver's 4.1.2. `FFXVK_DEBUG=1` logs each moved allocation
 and each pipeline made wave64.
 
+## Asynchronous compute
+
+FSR's passes are all compute, so a program can run FSR on a compute-only queue (AMD's
+API records into whatever command buffer it is given) while its graphics queue starts
+on the next frame. The output is the same: the probe's `--compute-queue` gives
+byte-identical images for FSR 3 and FSR 4. AMD's backend records one barrier per
+context with graphics stages in it. The bridge turns those stages into
+`ALL_COMMANDS`, which every queue accepts, so validation stays clean on both queues.
+
+`build/ffxasync <DLL directory> [--fsr 3|4] [--load raster|compute]` measures what
+this gains. Each frame has a load (a stand-in for the game's rendering), FSR at
+3840x2160 Quality, and a light post pass. It runs every frame on the graphics queue,
+then again with FSR on the compute queue, overlapped with the next frame's load. The
+inputs are double-buffered, the images use `VK_SHARING_MODE_CONCURRENT`, and timeline
+semaphores keep the order. Async adds one frame of latency.
+
+RX 7900 XTX, RADV, GPU time per frame with a depth-only raster load (full-screen
+passes: fill-bound, the shader cores mostly free, like shadow maps or a depth prepass):
+
+| Load | FSR 3.1.6 serial | FSR 3.1.6 async | FSR 4.1.2 serial | FSR 4.1.2 async |
+|---|---|---|---|---|
+| ~0.8 ms | 1.88 ms | **1.34 ms** (+40%) | 2.92 ms | 3.06 ms (-5%) |
+| ~3 ms | 3.98 ms | **3.47 ms** (+15%) | 3.77 ms | 3.98 ms (-5%) |
+| ~12 ms | 12.56 ms | **12.08 ms** (+4%) | 13.52 ms | 13.70 ms (-1%) |
+
+- **FSR 3:** async hides about 0.5 ms of its 0.77 ms. On the graphics queue, AMD's
+  FSR 3 backend waits for the work before it.
+- **FSR 4:** its passes already overlap fill-bound work on the graphics queue, so
+  async gains nothing and adds about 0.15 ms of synchronisation.
+- **Shader-bound load** (`--load compute`): neither version gains, since the load
+  leaves no shader cores free.
+
+So async compute is worth it for FSR 3 in programs whose frames have fill- or
+geometry-bound work. For FSR 4 on this GPU, keep it on the graphics queue.
+`--concurrency` checks that the two queues run at the same time at all on a given
+GPU and driver.
+
 The current Vulkan thunk table and message/allocation callback bridges assume one
 application device and one callback set. Concurrent independent devices/contexts,
 Vulkan allocation callbacks supplied by the DLL, Windows exception unwinding,

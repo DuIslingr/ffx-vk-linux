@@ -37,7 +37,7 @@ struct Vulkan {
 }
 
 int main(int argc, char** argv) {
-    bool requireFsr4 = false, dispatch = false, validate = false;
+    bool requireFsr4 = false, dispatch = false, validate = false, computeQueue = false;
     const char* directory = nullptr;
     const char* output = nullptr;
     for (int i = 1; i < argc; ++i) {
@@ -45,12 +45,13 @@ int main(int argc, char** argv) {
         if (arg == "--require-fsr4") requireFsr4 = true;
         else if (arg == "--dispatch") dispatch = true;
         else if (arg == "--validate") validate = true;
+        else if (arg == "--compute-queue") computeQueue = true;
         else if (arg == "--output" && i + 1 < argc) { output = argv[++i]; dispatch = true; }
         else if (!directory && arg[0] != '-') directory = argv[i];
         else { std::fprintf(stderr, "unknown or incomplete argument: %s\n", argv[i]); return 2; }
     }
     if (!directory) {
-        std::fprintf(stderr, "ffxquery <SDK DLL directory> [--require-fsr4] [--dispatch] [--validate] [--output image.ppm]\n");
+        std::fprintf(stderr, "ffxquery <SDK DLL directory> [--require-fsr4] [--dispatch] [--validate] [--compute-queue] [--output image.ppm]\n");
         return 2;
     }
     Vulkan vk;
@@ -97,8 +98,13 @@ int main(int argc, char** argv) {
     std::vector<VkQueueFamilyProperties> queues(nq);
     vkGetPhysicalDeviceQueueFamilyProperties(gpu, &nq, queues.data());
     uint32_t family = 0;
-    while (family < nq && !(queues[family].queueFlags & VK_QUEUE_COMPUTE_BIT)) ++family;
-    if (family == nq) { std::fprintf(stderr, "no compute queue\n"); return 1; }
+    // (--compute-queue: a compute-only family, as an application running FSR asynchronously would use)
+    auto wanted = [&](uint32_t f) {
+        return (queues[f].queueFlags & VK_QUEUE_COMPUTE_BIT) && (!computeQueue || !(queues[f].queueFlags & VK_QUEUE_GRAPHICS_BIT));
+    };
+    while (family < nq && !wanted(family)) ++family;
+    if (family == nq) { std::fprintf(stderr, computeQueue ? "no compute-only queue\n" : "no compute queue\n"); return 1; }
+    std::printf("queue family %u (%s)\n", family, (queues[family].queueFlags & VK_QUEUE_GRAPHICS_BIT) ? "graphics and compute" : "compute only");
 
     // Core 1.3 includes float16/int8, integer dot product and subgroup-size control.
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
