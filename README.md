@@ -86,6 +86,13 @@ the Vulkan functions it gives the DLL:
   `subgroupSizeControl` on the application's device. `FFXVK_WAVE64=0` leaves wave
   sizes alone.
 
+One more setting is up to the application, because Mesa reads it when the Vulkan
+instance is created: **`radv_disable_dcc_stores=true`** (a RADV driconf option, also
+accepted as an environment variable) keeps DCC compression off storage images. FSR 4's
+compressed storage writes cost about 0.3 ms per frame at 4K (2.60 -> 2.28 ms). FSR 3
+and the game's own rendering measured the same either way. Set it in the environment,
+or with `setenv` before the program's `vkCreateInstance`. Other drivers ignore it.
+
 The probe's output is byte-identical with and without these changes, for FSR 3 and
 FSR 4 over three frames. Measured on an RX 7900 XTX (Mesa RADV 26.2.6), upscaling to
 3840x2160 in Quality mode inside a game; GPU time from timestamps around the FSR
@@ -97,17 +104,19 @@ dispatch:
 | Cached memory types | | 3.2 ms |
 | Cached memory and wave64 | 0.7 ms | 2.7 ms |
 | All three | 0.7 ms | 2.6 ms |
+| All three and `radv_disable_dcc_stores` | 0.7 ms | 2.28 ms |
 
 Against the same SDK's D3D12 version under Proton (vkd3d-proton, same GPU and
-driver), FSR's cost measured the same way for both (its frame time minus the
-native frame time; the D3D12 window was 3840x1999, scaled to 3840x2160), averaged
-over five views:
+driver), back to back in desktop windows: FSR's GPU cost is the GPU frame time
+(Unity's FrameTimingManager) with FSR minus the GPU frame time with bilinear
+upscaling from the same 2/3 render resolution, averaged over five views. The D3D12
+window was 3840x1999, scaled to 3840x2160.
 
-| Frame-time cost | FSR 3 | FSR 4 |
+| GPU cost, 4K Quality | FSR 3 | FSR 4 |
 |---|---|---|
-| This library, all three changes | 0.30 ms (3.1.6) | 2.27 ms (4.1.2) |
-| D3D12 through vkd3d-proton | 0.33 ms (3.1.5) | 2.12 ms (4.1.1) |
-| This library before the changes | ~0.8 ms | ~4.0 ms |
+| This library, all three changes, `radv_disable_dcc_stores` | 0.72 ms (3.1.6) | 2.30 ms (4.1.2) |
+| D3D12 through vkd3d-proton | 0.74 ms (3.1.5) | 2.54 ms (4.1.1) |
+| This library, all three changes, DCC stores on | 0.76 ms | 2.67 ms |
 
 Running the DLLs as Windows code under Wine, without this library, cost the same as
 the "before" rows: the changes, not the bridge, close the gap. The D3D12 FSR 4 is
