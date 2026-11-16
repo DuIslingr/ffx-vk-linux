@@ -116,11 +116,17 @@ window was 3840x1999, scaled to 3840x2160.
 |---|---|---|
 | This library, all three changes, `radv_disable_dcc_stores` | 0.72 ms (3.1.6) | 2.30 ms (4.1.2) |
 | D3D12 through vkd3d-proton | 0.74 ms (3.1.5) | 2.54 ms (4.1.1) |
+| D3D12 through vkd3d-proton, `radv_disable_dcc_stores` | | 2.28 ms (4.1.1) |
 | This library, all three changes, DCC stores on | 0.76 ms | 2.67 ms |
 
 Running the DLLs as Windows code under Wine, without this library, cost the same as
-the "before" rows: the changes, not the bridge, close the gap. The D3D12 FSR 4 is
-the SDK's 4.1.1, not the driver's 4.1.2. `FFXVK_DEBUG=1` logs each moved allocation
+the "before" rows: the changes, not the bridge, close the gap. vkd3d-proton makes the
+first three choices on its own (it allocates only cached and Resizable BAR VRAM types
+and runs those passes as wave64), and with `radv_disable_dcc_stores` it gains the same
+~0.25 ms: the two paths are then level, so nothing else vkd3d-proton does differently
+(images kept in `GENERAL`, fewer barriers, constant buffers without copies) is worth
+measurable time. Proton players of D3D12 games with FSR 4 on RADV gain from the setting
+too. The D3D12 FSR 4 is the SDK's 4.1.1, not the driver's 4.1.2. `FFXVK_DEBUG=1` logs each moved allocation
 and each pipeline made wave64.
 
 ## Asynchronous compute
