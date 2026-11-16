@@ -13,6 +13,8 @@
 // `frames` frames), and the gain.
 //
 //   ffxasync <AMD's DLL directory> [--size 3840x2160] [--ratio 1.5] [--frames 300] [--loads 0.5,1,2,4,8] [--fsr 3|4]
+//            [--output rgba16f|rgba8|r11g11b10]   the output image's format (rgba16f: an HDR pipeline's; FSR 4's last pass
+//                                                  costs more with it on RADV unless FSR's own images are linear)
 #include "ffx_vk_linux.h"
 
 #include <algorithm>
@@ -322,13 +324,14 @@ struct Bench {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "ffxasync <SDK DLL directory> [--size WxH] [--ratio 1.5] [--frames 300] [--loads 0.5,1,2,4,8] [--fsr 3|4]\n");
+        std::fprintf(stderr, "ffxasync <SDK DLL directory> [--size WxH] [--ratio 1.5] [--frames 300] [--loads 0.5,1,2,4,8] [--fsr 3|4] [--output rgba16f|rgba8|r11g11b10]\n");
         return 2;
     }
     uint32_t outW = 3840, outH = 2160, frames = 300;
     float ratio = 1.5f;
     int fsrMajor = 0;
     bool concurrencyTest = false, rasterLoad = true;
+    VkFormat outputFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
     std::vector<double> loads = {0.5, 1, 2, 4, 8};
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -338,6 +341,11 @@ int main(int argc, char** argv) {
         else if (a == "--frames" && next) frames = uint32_t(std::atoi(next)), ++i;
         else if (a == "--fsr" && next) fsrMajor = std::atoi(next), ++i;
         else if (a == "--concurrency") concurrencyTest = true;
+        else if (a == "--output" && next) {
+            const std::string f = next;
+            outputFormat = f == "rgba8" ? VK_FORMAT_R8G8B8A8_UNORM : f == "r11g11b10" ? VK_FORMAT_B10G11R11_UFLOAT_PACK32 : VK_FORMAT_R16G16B16A16_SFLOAT;
+            ++i;
+        }
         else if (a == "--load" && next) rasterLoad = std::string(next) != "compute", ++i;
         else if (a == "--loads" && next) {
             loads.clear();
@@ -450,7 +458,7 @@ int main(int argc, char** argv) {
             b.makeImage(b.colour[s], VK_FORMAT_R16G16B16A16_SFLOAT, b.renderW, b.renderH, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
             b.makeImage(b.depth[s], VK_FORMAT_R32_SFLOAT, b.renderW, b.renderH, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
             b.makeImage(b.motion[s], VK_FORMAT_R16G16_SFLOAT, b.renderW, b.renderH, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-            b.makeImage(b.output[s], VK_FORMAT_R16G16B16A16_SFLOAT, outW, outH, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+            b.makeImage(b.output[s], outputFormat, outW, outH, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
         }
         VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;

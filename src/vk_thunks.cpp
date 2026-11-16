@@ -223,6 +223,57 @@ __attribute__((ms_abi)) void msCmdPipelineBarrier(VkCommandBuffer cmd, VkPipelin
     r_vkCmdPipelineBarrier(cmd, anyQueueStages(src), anyQueueStages(dst), dep, nm, mm.data(), nb, bb.data(), ni, ii.data());
 }
 
+// ---- FSR 4's own images: linear tiling ------------------------------------------------------------------------------
+// FSR 4's last pass writes three full-size images (its two histories and the program's output), a 2x2 block of pixels per
+// thread. On RADV (RX 7900 XTX, Mesa 26.2.6) that pass takes 0.80 ms at 4K when the program's output image is RGBA16F
+// like FSR's own histories, 0.54 ms with a 32-bit output, and 0.48 ms either way once FSR's RGBA16F images are linear
+// instead of tiled: FSR 4 as a whole 2.64 -> 2.32 ms with an RGBA16F output (1.25 -> 1.10 ms at 1440p, the same at
+// 1080p), 2.41 -> 2.35 ms with a 32-bit one. The output is byte-identical (the probe). Why the tiled layout costs this
+// was not established. FSR 3 measures 1 to 3% slower with linear images, so only an FSR 4 context's images change: the
+// DLL's backend makes every version's images, so the version comes from the context being made or dispatched
+// (setUpscaler). Only on RADV, where it was measured, and only where the driver takes the image as linear.
+// FFXVK_LINEAR_IMAGES=0 leaves the tiling alone.
+thread_local int upscalerMajor = 0;
+thread_local VkPhysicalDevice upscalerDevice = VK_NULL_HANDLE;
+
+bool linearImages() {
+    static const bool on = [] { const char* e = std::getenv("FFXVK_LINEAR_IMAGES"); return !e || e[0] != '0'; }();
+    return on;
+}
+
+bool isRadv(VkPhysicalDevice device) {
+    static std::mutex m;
+    static std::vector<std::pair<VkPhysicalDevice, bool>> known;
+    std::lock_guard<std::mutex> lock(m);
+    for (const auto& [d, radv] : known) if (d == device) return radv;
+    bool radv = false;
+    if (auto get = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(dlsym(libvulkan(), "vkGetPhysicalDeviceProperties2"))) {
+        VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+        get(device, &p);
+        radv = driver.driverID == VK_DRIVER_ID_MESA_RADV;
+    }
+    known.push_back({device, radv});
+    return radv;
+}
+
+__attribute__((ms_abi)) VkResult msCreateImage(VkDevice device, const VkImageCreateInfo* info, const VkAllocationCallbacks* allocator, VkImage* out) {
+    if (linearImages() && info && upscalerMajor == 4 && upscalerDevice && info->tiling == VK_IMAGE_TILING_OPTIMAL &&
+        info->imageType == VK_IMAGE_TYPE_2D && info->format == VK_FORMAT_R16G16B16A16_SFLOAT && info->mipLevels == 1 && info->arrayLayers == 1 &&
+        info->samples == VK_SAMPLE_COUNT_1_BIT && (info->usage & VK_IMAGE_USAGE_STORAGE_BIT) && !info->pNext && isRadv(upscalerDevice)) {
+        static const auto supported = reinterpret_cast<PFN_vkGetPhysicalDeviceImageFormatProperties>(dlsym(libvulkan(), "vkGetPhysicalDeviceImageFormatProperties"));
+        VkImageFormatProperties p{};
+        if (supported && supported(upscalerDevice, info->format, info->imageType, VK_IMAGE_TILING_LINEAR, info->usage, info->flags, &p) == VK_SUCCESS &&
+            p.maxExtent.width >= info->extent.width && p.maxExtent.height >= info->extent.height) {
+            VkImageCreateInfo linear = *info;
+            linear.tiling = VK_IMAGE_TILING_LINEAR;
+            if (verbose()) std::fprintf(stderr, "ffx-vk-linux: FSR 4's %ux%u RGBA16F image (usage 0x%x) as linear\n", info->extent.width, info->extent.height, info->usage);
+            return r_vkCreateImage(device, &linear, allocator, out);
+        }
+    }
+    return r_vkCreateImage(device, info, allocator, out);
+}
+
 __attribute__((ms_abi)) VkResult msCreateShaderModule(VkDevice device,
         const VkShaderModuleCreateInfo* info, const VkAllocationCallbacks* allocator, VkShaderModule* out) {
     if (!info || !info->pCode || info->codeSize % sizeof(uint32_t)) return VK_ERROR_INVALID_SHADER_NV;
@@ -268,6 +319,7 @@ PFN_vkVoidFunction special(const char* name) {
     if (std::strcmp(name, "vkAllocateMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&msAllocateMemory);
     if (std::strcmp(name, "vkCreateComputePipelines") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&msCreateComputePipelines);
     if (std::strcmp(name, "vkCmdPipelineBarrier") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&msCmdPipelineBarrier);
+    if (std::strcmp(name, "vkCreateImage") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&msCreateImage);
     return nullptr;
 }
 
@@ -347,5 +399,6 @@ PFN_vkVoidFunction msGetInstanceProcAddrFor(PFN_vkGetInstanceProcAddr real) {
 }
 
 void setDriverProvider(void* update) { driverProvider = reinterpret_cast<UpdateProvider>(update); }
+void setUpscaler(int major, VkPhysicalDevice device) { upscalerMajor = major; upscalerDevice = device; }
 
 } // namespace ffxvk

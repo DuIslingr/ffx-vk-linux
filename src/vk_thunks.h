@@ -19,4 +19,8 @@ PFN_vkVoidFunction msGetInstanceProcAddrFor(PFN_vkGetInstanceProcAddr real);
 // The SDK's private Vulkan entry additionally takes the VkDevice as its first argument.
 void setDriverProvider(void* update);
 
+// The upscaler whose context this thread is making or dispatching (its major version, 0: none or unknown) and the
+// program's physical device: FSR 4's images are made differently (vk_thunks.cpp, "linear tiling").
+void setUpscaler(int major, VkPhysicalDevice device);
+
 } // namespace ffxvk

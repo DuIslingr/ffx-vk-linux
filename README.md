@@ -66,7 +66,7 @@ logical device; the bridge cannot change an already-created device.
 
 ## Performance on RADV
 
-Two choices of AMD's Vulkan code cost a lot on RADV, and the bridge changes both in
+Some choices of AMD's Vulkan code cost a lot on RADV, and the bridge changes them in
 the Vulkan functions it gives the DLL:
 
 - **Memory types:** the DLL allocates its buffers (about 300 MB per 4K context)
@@ -85,6 +85,14 @@ the Vulkan functions it gives the DLL:
   gets `requiredSubgroupSize` 64, replacing an explicit wave32 request. This needs
   `subgroupSizeControl` on the application's device. `FFXVK_WAVE64=0` leaves wave
   sizes alone.
+- **Image tiling (FSR 4):** FSR 4's last pass writes three full-size images: its own
+  two RGBA16F histories and the program's output. When the output image is RGBA16F
+  too (an HDR pipeline), that pass takes 0.80 ms at 4K, against 0.54 ms with a 32-bit
+  output. With FSR 4's own RGBA16F images linear instead of tiled it takes 0.48 ms
+  either way, so an FSR 4 context's RGBA16F storage images are made linear (on RADV,
+  where the driver accepts them). Why the tiled layout costs this was not
+  established. FSR 3 measured 1 to 3% slower with linear images and is left alone.
+  `FFXVK_LINEAR_IMAGES=0` leaves the tiling alone.
 
 One more setting is up to the application, because Mesa reads it when the Vulkan
 instance is created: **`radv_disable_dcc_stores=true`** (a RADV driconf option, also
@@ -106,6 +114,31 @@ dispatch:
 | All three | 0.7 ms | 2.6 ms |
 | All three and `radv_disable_dcc_stores` | 0.7 ms | 2.28 ms |
 
+The game in that table gives FSR a 32-bit output image, where linear images change
+nothing measurable (2.26 ms with and without). The gain is for RGBA16F outputs:
+`build/ffxasync --fsr 4 --output <format>`, FSR 4.1.2 on its own, Quality mode unless
+noted, `radv_disable_dcc_stores` set:
+
+| Output size, the program's output format | Tiled | Linear (the default) |
+|---|---|---|
+| 3840x2160, RGBA16F | 2.64 ms | **2.31 ms** |
+| 3840x2160, RGBA16F, Performance mode | 2.58 ms | **2.31 ms** |
+| 3840x2160, R11G11B10 or RGBA8 | 2.41 ms | 2.35 ms |
+| 2560x1440, RGBA16F | 1.25 ms | **1.10 ms** |
+| 2560x1440, RGBA8 | 1.14 ms | 1.09 ms |
+| 1920x1080, RGBA16F | 0.67 ms | 0.67 ms |
+
+For scale, AMD's own reference time for this GPU is 3.07 ms (FSR 4, the full INT8
+model, 3840x2160 in Performance mode, peak clocks, sharpening off; the page states
+neither the operating system nor the API):
+<https://gpuopen.com/manuals/fsr_sdk/techniques/super-resolution-ml/>.
+
+Where FSR 4's time goes at 4K Quality in that game, measured by leaving passes out one
+at a time: the 12 network passes 1.39 ms, the last pass 0.48 ms, the first pass and the
+rest about 0.4 ms. The 13 small passes between the network's layers (they zero the
+tensors' borders) cost 0.015 ms together. Timestamps around single dispatches do not
+show this: they credit a pass's time to the one after it.
+
 Against the same SDK's D3D12 version under Proton (vkd3d-proton, same GPU and
 driver), back to back in desktop windows: FSR's GPU cost is the GPU frame time
 (Unity's FrameTimingManager) with FSR minus the GPU frame time with bilinear
@@ -126,8 +159,43 @@ and runs those passes as wave64), and with `radv_disable_dcc_stores` it gains th
 ~0.25 ms: the two paths are then level, so nothing else vkd3d-proton does differently
 (images kept in `GENERAL`, fewer barriers, constant buffers without copies) is worth
 measurable time. Proton players of D3D12 games with FSR 4 on RADV gain from the setting
-too. The D3D12 FSR 4 is the SDK's 4.1.1, not the driver's 4.1.2. `FFXVK_DEBUG=1` logs each moved allocation
-and each pipeline made wave64.
+too. The D3D12 FSR 4 is the SDK's 4.1.1, not the driver's 4.1.2. `FFXVK_DEBUG=1` logs each moved allocation,
+each pipeline made wave64 and each image made linear.
+
+## FSR 4 Lite (opt-in)
+
+AMD's driver DLL also holds FSR 4 Lite, a smaller network that AMD gives its
+integrated GPUs, and picks the model from the GPU family it is told. With
+**`FFXVK_FSR4_MODEL=lite`** in the environment before the DLLs load, the bridge
+answers that question with an integrated GPU's family (GC 11.5.0, the Radeon 890M's)
+in place of the real one, and the DLL runs Lite. Nothing else changes: the DLL's
+Vulkan queries still see the real GPU, the version stays "4.1.2", and FSR 3 and 2 are
+as before. Without the variable, or with any other value, the real family is reported.
+
+Lite's picture is not the full model's: it is AMD's own trade of quality for time.
+RX 7900 XTX, RADV, Quality mode, FSR 4.1.2 on its own (`ffxasync`), and inside a game
+at 4K (GPU timestamps around the dispatch; 329 -> 466 frames per second there):
+
+| Output size | Full model | Lite |
+|---|---|---|
+| 3840x2160 | 2.30 ms | **1.39 ms** |
+| 2560x1440 | 1.09 ms | **0.67 ms** |
+| 1920x1080 | 0.68 ms | **0.39 ms** |
+| 3840x2160, in a game | 2.27 ms | **1.36 ms** |
+
+Validation is clean with it, and linear images make no difference to Lite. Which
+model a family gets is the driver DLL's decision and may change with its version:
+checked with `amdvkffx64.dll` of Adrenalin 26.10.1.
+
+## Faster shaders: related work
+
+[fsr4-shader-performance-overrides](https://github.com/zgauthier2000/fsr4-shader-performance-overrides)
+(GPL) rewrites FSR 4's slowest INT8 shaders with byte-identical output, and has
+faster builds with a different picture. Its published rewrites are for the D3D12
+DLL's shaders as vkd3d-proton translates them, not for the Vulkan DLL's shaders this
+bridge loads; its notes on where FSR 4's time goes are the best there are. On an
+RX 7900 XTX, linear images (above) already bring FSR 4's last pass to about the time
+its rewrite reaches; on smaller RDNA 3 cards its measurements leave more to gain.
 
 ## Asynchronous compute
 
@@ -138,7 +206,7 @@ byte-identical images for FSR 3 and FSR 4. AMD's backend records one barrier per
 context with graphics stages in it. The bridge turns those stages into
 `ALL_COMMANDS`, which every queue accepts, so validation stays clean on both queues.
 
-`build/ffxasync <DLL directory> [--fsr 3|4] [--load raster|compute]` measures what
+`build/ffxasync <DLL directory> [--fsr 3|4] [--load raster|compute] [--output rgba16f|rgba8|r11g11b10]` measures what
 this gains. Each frame has a load (a stand-in for the game's rendering), FSR at
 3840x2160 Quality, and a light post pass. It runs every frame on the graphics queue,
 then again with FSR on the compute queue, overlapped with the next frame's load. The
@@ -150,14 +218,14 @@ passes: fill-bound, the shader cores mostly free, like shadow maps or a depth pr
 
 | Load | FSR 3.1.6 serial | FSR 3.1.6 async | FSR 4.1.2 serial | FSR 4.1.2 async |
 |---|---|---|---|---|
-| ~0.8 ms | 1.88 ms | **1.34 ms** (+40%) | 2.92 ms | 3.06 ms (-5%) |
-| ~3 ms | 3.98 ms | **3.47 ms** (+15%) | 3.77 ms | 3.98 ms (-5%) |
-| ~12 ms | 12.56 ms | **12.08 ms** (+4%) | 13.52 ms | 13.70 ms (-1%) |
+| ~0.8 ms | 1.88 ms | **1.34 ms** (+40%) | 2.58 ms | 2.70 ms (-4%) |
+| ~3 ms | 3.98 ms | **3.47 ms** (+15%) | 3.67 ms | 3.90 ms (-6%) |
+| ~12 ms | 12.56 ms | **12.08 ms** (+4%) | 13.31 ms | 13.54 ms (-2%) |
 
 - **FSR 3:** async hides about 0.5 ms of its 0.77 ms. On the graphics queue, AMD's
   FSR 3 backend waits for the work before it.
 - **FSR 4:** its passes already overlap fill-bound work on the graphics queue, so
-  async gains nothing and adds about 0.15 ms of synchronisation.
+  async gains nothing and adds 0.1 to 0.2 ms of synchronisation.
 - **Shader-bound load** (`--load compute`): neither version gains, since the load
   leaves no shader cores free.
 
