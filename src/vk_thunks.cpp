@@ -11,6 +11,7 @@
 #include <atomic>
 #include <fstream>
 #include <filesystem>
+#include <vector>
 
 namespace ffxvk {
 
@@ -51,6 +52,114 @@ __attribute__((ms_abi)) void msProperties2(VkPhysicalDevice device, VkPhysicalDe
     identifyDriverAdapter(device, r_vkGetPhysicalDeviceProperties2, properties);
 }
 
+// ---- Faster on RADV: memory types and wave size --------------------------------------------------------------------
+// Measured with FSR 3.1.6 and 4.1.2 on an RX 7900 XTX (RADV, Mesa 26.2.6) against the same SDK's D3D12 version through
+// vkd3d-proton, which picks its own memory types and wave sizes: at 4K, FSR 4 took 4.3 ms here against ~2.2 there, FSR
+// 3 1.15 ms against ~0.4. Two choices of AMD's Vulkan code made the difference; both are changed here, and the probe's
+// output is byte-identical either way (FSR 3 and 4, three frames):
+// - Memory: the DLL allocates its buffers (~300 MB per 4K context) from RADV's "device coherent, device uncached" types
+//   (VK_AMD_device_coherent_memory; RADV lists them whether or not the device enabled the feature), which the GPU's
+//   caches skip. They get the cached type with the same other properties in the same heap instead. FFXVK_UNCACHED=1
+//   keeps the DLL's choice.
+// - Wave size: RADV compiles the DLL's compute shaders as wave32 (FSR 4 also asks for 32 on 13 of its 30); vkd3d-proton
+//   runs the same passes as wave64. A shader whose workgroup size is a multiple of 64 and that uses no subgroup
+//   operations (so its results can't depend on the wave size) gets requiredSubgroupSize 64, an explicit wave32 request
+//   included. Needs subgroupSizeControl on the program's device; FFXVK_WAVE64=0 leaves the sizes alone.
+// FSR 4 went from 4.3 to 3.2 ms (memory) to 2.7 ms (wave size), FSR 3 from 1.15 to 0.7 ms.
+
+std::mutex tuneMutex;
+VkPhysicalDeviceMemoryProperties memoryTypes{};   // the DLL's own query (one device: the program's)
+std::vector<std::pair<VkShaderModule, bool>> modules;   // module, may run as wave64
+
+bool cachedMemory() {
+    static const bool on = [] { const char* e = std::getenv("FFXVK_UNCACHED"); return !e || e[0] == '0'; }();
+    return on;
+}
+bool wave64() {
+    static const bool on = [] { const char* e = std::getenv("FFXVK_WAVE64"); return !e || e[0] != '0'; }();
+    return on;
+}
+
+// a compute shader that can run as wave64: no subgroup operations, a workgroup size that is a multiple of 64
+bool wave64Safe(const uint32_t* w, size_t n) {
+    uint32_t total = 0;
+    for (size_t i = 5; i < n;) {
+        const uint32_t op = w[i] & 0xffff, count = w[i] >> 16;
+        if (!count || i + count > n) return false;
+        if (op == 17 && w[i + 1] >= 61 && w[i + 1] <= 69) return false;   // Capability GroupNonUniform*
+        if (op == 17 && (w[i + 1] == 4423 || w[i + 1] == 5568 || w[i + 1] == 5569)) return false;   // SubgroupBallotKHR, Intel shuffles
+        if (op == 16 && count >= 6 && w[i + 2] == 17) total = w[i + 3] * w[i + 4] * w[i + 5];   // ExecutionMode LocalSize
+        if (op == 331) return false;   // ExecutionModeId (LocalSizeId: not known here)
+        i += count;
+    }
+    return total && total % 64 == 0;
+}
+
+void noteModule(VkShaderModule module, const uint32_t* words, size_t n) {
+    if (!wave64()) return;
+    std::lock_guard<std::mutex> lock(tuneMutex);
+    modules.push_back({module, wave64Safe(words, n)});
+}
+
+__attribute__((ms_abi)) void msMemoryProperties(VkPhysicalDevice device, VkPhysicalDeviceMemoryProperties* p) {
+    r_vkGetPhysicalDeviceMemoryProperties(device, p);
+    std::lock_guard<std::mutex> lock(tuneMutex);
+    memoryTypes = *p;
+}
+__attribute__((ms_abi)) void msMemoryProperties2(VkPhysicalDevice device, VkPhysicalDeviceMemoryProperties2* p) {
+    r_vkGetPhysicalDeviceMemoryProperties2(device, p);
+    std::lock_guard<std::mutex> lock(tuneMutex);
+    memoryTypes = p->memoryProperties;
+}
+
+__attribute__((ms_abi)) VkResult msAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* info,
+        const VkAllocationCallbacks* allocator, VkDeviceMemory* out) {
+    const VkMemoryPropertyFlags amd = VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD | VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
+    if (cachedMemory() && info) {
+        VkPhysicalDeviceMemoryProperties m;
+        { std::lock_guard<std::mutex> lock(tuneMutex); m = memoryTypes; }
+        const uint32_t t = info->memoryTypeIndex;
+        if (t < m.memoryTypeCount && (m.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD)) {
+            const VkMemoryPropertyFlags want = m.memoryTypes[t].propertyFlags & ~amd;
+            for (uint32_t i = 0; i < m.memoryTypeCount; ++i)
+                if (m.memoryTypes[i].propertyFlags == want && m.memoryTypes[i].heapIndex == m.memoryTypes[t].heapIndex) {
+                    VkMemoryAllocateInfo cached = *info;
+                    cached.memoryTypeIndex = i;
+                    if (verbose()) std::fprintf(stderr, "ffx-vk-linux: %llu bytes: memory type %u (uncached) -> %u\n", (unsigned long long)info->allocationSize, t, i);
+                    return r_vkAllocateMemory(device, &cached, allocator, out);
+                }
+        }
+    }
+    return r_vkAllocateMemory(device, info, allocator, out);
+}
+
+__attribute__((ms_abi)) VkResult msCreateComputePipelines(VkDevice device, VkPipelineCache cache, uint32_t n,
+        const VkComputePipelineCreateInfo* infos, const VkAllocationCallbacks* allocator, VkPipeline* out) {
+    if (!wave64() || !infos) return r_vkCreateComputePipelines(device, cache, n, infos, allocator, out);
+    std::vector<VkComputePipelineCreateInfo> copy(infos, infos + n);
+    std::vector<VkPipelineShaderStageRequiredSubgroupSizeCreateInfo> sizes(n);
+    unsigned changed = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        bool safe = false;
+        {
+            std::lock_guard<std::mutex> lock(tuneMutex);
+            for (const auto& [module, ok] : modules) if (module == infos[i].stage.module) safe = ok;
+        }
+        if (!safe) continue;
+        // an explicit wave32 request alone in the stage's chain is replaced; any other chain or size stays as it is
+        const VkBaseInStructure* chain = static_cast<const VkBaseInStructure*>(infos[i].stage.pNext);
+        if (chain && !(chain->sType == VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO && !chain->pNext &&
+                       reinterpret_cast<const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo*>(chain)->requiredSubgroupSize == 32))
+            continue;
+        sizes[i] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, nullptr, 64};
+        copy[i].stage.pNext = &sizes[i];
+        copy[i].stage.flags &= ~VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT;
+        ++changed;
+    }
+    if (verbose() && changed) std::fprintf(stderr, "ffx-vk-linux: %u of %u compute pipelines as wave64\n", changed, n);
+    return r_vkCreateComputePipelines(device, cache, n, copy.data(), allocator, out);
+}
+
 __attribute__((ms_abi)) VkResult msCreateShaderModule(VkDevice device,
         const VkShaderModuleCreateInfo* info, const VkAllocationCallbacks* allocator, VkShaderModule* out) {
     if (!info || !info->pCode || info->codeSize % sizeof(uint32_t)) return VK_ERROR_INVALID_SHADER_NV;
@@ -71,7 +180,9 @@ __attribute__((ms_abi)) VkResult msCreateShaderModule(VkDevice device,
         std::ofstream file(path, std::ios::binary);
         file.write(reinterpret_cast<const char*>(normalized.pCode), normalized.codeSize);
     }
-    return r_vkCreateShaderModule(device, &normalized, allocator, out);
+    VkResult result = r_vkCreateShaderModule(device, &normalized, allocator, out);
+    if (result == VK_SUCCESS) noteModule(*out, normalized.pCode, normalized.codeSize / sizeof(uint32_t));
+    return result;
 }
 
 __attribute__((ms_abi)) int32_t msUpdateProvider(VkDevice, void* data, uint32_t size) {
@@ -84,6 +195,18 @@ __attribute__((ms_abi)) int32_t msUpdateProvider(VkDevice, void* data, uint32_t 
     return result;
 }
 
+// the hand-written wrappers in place of the generated ones (null: the generated one)
+PFN_vkVoidFunction special(const char* name) {
+    if (std::strcmp(name, "vkGetPhysicalDeviceProperties2") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&msProperties2);
+    if (std::strcmp(name, "vkCreateShaderModule") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&msCreateShaderModule);
+    if (std::strcmp(name, "vkGetPhysicalDeviceMemoryProperties") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&msMemoryProperties);
+    if (std::strcmp(name, "vkGetPhysicalDeviceMemoryProperties2") == 0 || std::strcmp(name, "vkGetPhysicalDeviceMemoryProperties2KHR") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(&msMemoryProperties2);
+    if (std::strcmp(name, "vkAllocateMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&msAllocateMemory);
+    if (std::strcmp(name, "vkCreateComputePipelines") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&msCreateComputePipelines);
+    return nullptr;
+}
+
 // the DLL's vkGetDeviceProcAddr: the real function recorded into its thunk, the thunk given
 __attribute__((ms_abi)) PFN_vkVoidFunction msGetDeviceProcAddr(VkDevice device, const char* name) {
     if (driverProvider && std::strcmp(name, "vkUpdateFfxApiProviderAMD") == 0)
@@ -94,10 +217,7 @@ __attribute__((ms_abi)) PFN_vkVoidFunction msGetDeviceProcAddr(VkDevice device, 
     if (!real || !t) return nullptr;
     std::lock_guard<std::mutex> lock(fillMutex);
     *t->real = real; // (one device at a time: the program's)
-    if (std::strcmp(name, "vkGetPhysicalDeviceProperties2") == 0)
-        return reinterpret_cast<PFN_vkVoidFunction>(&msProperties2);
-    if (std::strcmp(name, "vkCreateShaderModule") == 0)
-        return reinterpret_cast<PFN_vkVoidFunction>(&msCreateShaderModule);
+    if (PFN_vkVoidFunction s = special(name)) return s;
     return t->wrapper;
 }
 __attribute__((ms_abi)) PFN_vkVoidFunction msGetInstanceProcAddr(VkInstance instance, const char* name) {
@@ -107,10 +227,7 @@ __attribute__((ms_abi)) PFN_vkVoidFunction msGetInstanceProcAddr(VkInstance inst
     if (!real || !t) return nullptr;
     std::lock_guard<std::mutex> lock(fillMutex);
     *t->real = real;
-    if (std::strcmp(name, "vkGetPhysicalDeviceProperties2") == 0)
-        return reinterpret_cast<PFN_vkVoidFunction>(&msProperties2);
-    if (std::strcmp(name, "vkCreateShaderModule") == 0)
-        return reinterpret_cast<PFN_vkVoidFunction>(&msCreateShaderModule);
+    if (PFN_vkVoidFunction s = special(name)) return s;
     return t->wrapper;
 }
 
@@ -148,8 +265,7 @@ void* vulkanImport(const std::string& name) {
     if (!t || !libvulkan()) return nullptr;
     *t->real = reinterpret_cast<PFN_vkVoidFunction>(dlsym(libvulkan(), name.c_str())); // (the loader's exported entry: any device, any instance)
     if (!*t->real) return nullptr;
-    if (name == "vkGetPhysicalDeviceProperties2") return reinterpret_cast<void*>(&msProperties2);
-    if (name == "vkCreateShaderModule") return reinterpret_cast<void*>(&msCreateShaderModule);
+    if (PFN_vkVoidFunction s = special(name.c_str())) return reinterpret_cast<void*>(s);
     if (verbose() && name == "vkGetPhysicalDeviceProperties2") return reinterpret_cast<void*>(&dbgProperties2);
     if (verbose() && name == "vkGetPhysicalDeviceFeatures2") return reinterpret_cast<void*>(&dbgFeatures2);
     if (verbose() && name == "vkEnumerateDeviceExtensionProperties") return reinterpret_cast<void*>(&dbgExtensions);

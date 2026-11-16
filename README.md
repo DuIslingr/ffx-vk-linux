@@ -64,6 +64,38 @@ without format, compute shader derivatives, and AMD coherent memory where
 advertised. Applications must enable the features their provider uses on the
 logical device; the bridge cannot change an already-created device.
 
+## Performance on RADV
+
+Two choices of AMD's Vulkan code cost a lot on RADV, and the bridge changes both in
+the Vulkan functions it gives the DLL:
+
+- **Memory types:** the DLL allocates its buffers (about 300 MB per 4K context)
+  from RADV's "device coherent, device uncached" types (`VK_AMD_device_coherent_memory`;
+  RADV lists them whether or not the device enabled the feature), which the GPU's
+  caches skip. The bridge allocates them from the cached type with the same other
+  properties instead. `FFXVK_UNCACHED=1` keeps the DLL's choice.
+- **Wave size:** RADV compiles the DLL's compute shaders as wave32, and FSR 4 asks
+  for wave32 on 13 of its 30. A shader whose workgroup size is a multiple of 64 and
+  that uses no subgroup operations, so its results can't depend on the wave size,
+  gets `requiredSubgroupSize` 64, replacing an explicit wave32 request. This needs
+  `subgroupSizeControl` on the application's device. `FFXVK_WAVE64=0` leaves wave
+  sizes alone.
+
+The probe's output is byte-identical with and without both changes, for FSR 3 and
+FSR 4 over three frames. Measured on an RX 7900 XTX (Mesa RADV 26.2.6), upscaling to
+3840x2160 in Quality mode inside a game:
+
+| GPU time per frame | FSR 3.1.6 | FSR 4.1.2 |
+|---|---|---|
+| Before | 1.15 ms | 4.3 ms |
+| Cached memory types | | 3.2 ms |
+| Cached memory and wave64 | 0.7 ms | 2.7 ms |
+| D3D12 version through vkd3d-proton, same GPU (estimated from frame times) | ~0.4 ms | ~2.2 ms |
+
+Running the DLLs as Windows code under Wine, without this library, gave the same
+timings as the "Before" row, so the remaining gap is in the Vulkan path itself.
+`FFXVK_DEBUG=1` logs each moved allocation and each pipeline made wave64.
+
 The current Vulkan thunk table and message/allocation callback bridges assume one
 application device and one callback set. Concurrent independent devices/contexts,
 Vulkan allocation callbacks supplied by the DLL, Windows exception unwinding,
