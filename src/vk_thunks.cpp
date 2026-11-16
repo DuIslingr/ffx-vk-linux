@@ -60,12 +60,15 @@ __attribute__((ms_abi)) void msProperties2(VkPhysicalDevice device, VkPhysicalDe
 // - Memory: the DLL allocates its buffers (~300 MB per 4K context) from RADV's "device coherent, device uncached" types
 //   (VK_AMD_device_coherent_memory; RADV lists them whether or not the device enabled the feature), which the GPU's
 //   caches skip. They get the cached type with the same other properties in the same heap instead. FFXVK_UNCACHED=1
-//   keeps the DLL's choice.
+//   keeps the DLL's choice. And its host-visible buffers (~200 MB at 4K for FSR 4) land in system memory: RADV lists
+//   the system-memory type before the CPU-visible VRAM one. With Resizable BAR (a CPU-visible VRAM heap of 4 GB or
+//   more) they go to VRAM, the same flags plus device-local. FFXVK_HOST_VRAM=0 leaves them where they are.
 // - Wave size: RADV compiles the DLL's compute shaders as wave32 (FSR 4 also asks for 32 on 13 of its 30); vkd3d-proton
 //   runs the same passes as wave64. A shader whose workgroup size is a multiple of 64 and that uses no subgroup
 //   operations (so its results can't depend on the wave size) gets requiredSubgroupSize 64, an explicit wave32 request
 //   included. Needs subgroupSizeControl on the program's device; FFXVK_WAVE64=0 leaves the sizes alone.
-// FSR 4 went from 4.3 to 3.2 ms (memory) to 2.7 ms (wave size), FSR 3 from 1.15 to 0.7 ms.
+// FSR 4 went from 4.3 to 3.2 ms (uncached memory) to 2.7 ms (wave size) to 2.6 ms (host-visible VRAM), FSR 3 from 1.15
+// to 0.7 ms (GPU timestamps around the dispatch).
 
 std::mutex tuneMutex;
 VkPhysicalDeviceMemoryProperties memoryTypes{};   // the DLL's own query (one device: the program's)
@@ -73,6 +76,10 @@ std::vector<std::pair<VkShaderModule, bool>> modules;   // module, may run as wa
 
 bool cachedMemory() {
     static const bool on = [] { const char* e = std::getenv("FFXVK_UNCACHED"); return !e || e[0] == '0'; }();
+    return on;
+}
+bool hostVram() {
+    static const bool on = [] { const char* e = std::getenv("FFXVK_HOST_VRAM"); return !e || e[0] != '0'; }();
     return on;
 }
 bool wave64() {
@@ -127,6 +134,26 @@ __attribute__((ms_abi)) VkResult msAllocateMemory(VkDevice device, const VkMemor
                     cached.memoryTypeIndex = i;
                     if (verbose()) std::fprintf(stderr, "ffx-vk-linux: %llu bytes: memory type %u (uncached) -> %u\n", (unsigned long long)info->allocationSize, t, i);
                     return r_vkAllocateMemory(device, &cached, allocator, out);
+                }
+        }
+    }
+    // host-visible allocations in system memory: the device-local, host-visible type with the same flags where that heap
+    // is large (Resizable BAR), as AMD's Windows driver would give them
+    if (hostVram() && info) {
+        VkPhysicalDeviceMemoryProperties m;
+        { std::lock_guard<std::mutex> lock(tuneMutex); m = memoryTypes; }
+        const uint32_t t = info->memoryTypeIndex;
+        if (t < m.memoryTypeCount) {
+            const VkMemoryPropertyFlags f = m.memoryTypes[t].propertyFlags;
+            if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+                for (uint32_t i = 0; i < m.memoryTypeCount; ++i) {
+                    const auto& heap = m.memoryHeaps[m.memoryTypes[i].heapIndex];
+                    if (m.memoryTypes[i].propertyFlags == (f | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && (heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && heap.size >= (4ull << 30)) {
+                        VkMemoryAllocateInfo vram = *info;
+                        vram.memoryTypeIndex = i;
+                        if (verbose()) std::fprintf(stderr, "ffx-vk-linux: %llu bytes: memory type %u (system) -> %u (VRAM)\n", (unsigned long long)info->allocationSize, t, i);
+                        return r_vkAllocateMemory(device, &vram, allocator, out);
+                    }
                 }
         }
     }

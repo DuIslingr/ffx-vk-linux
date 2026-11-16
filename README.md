@@ -74,6 +74,11 @@ the Vulkan functions it gives the DLL:
   RADV lists them whether or not the device enabled the feature), which the GPU's
   caches skip. The bridge allocates them from the cached type with the same other
   properties instead. `FFXVK_UNCACHED=1` keeps the DLL's choice.
+- **Host-visible buffers:** the DLL's host-visible buffers (about 200 MB at 4K for
+  FSR 4) land in system memory, because RADV lists the system-memory type before
+  the CPU-visible VRAM one. With Resizable BAR (a CPU-visible VRAM heap of 4 GB or
+  more) they go to VRAM with the same flags plus device-local.
+  `FFXVK_HOST_VRAM=0` leaves them where they are.
 - **Wave size:** RADV compiles the DLL's compute shaders as wave32, and FSR 4 asks
   for wave32 on 13 of its 30. A shader whose workgroup size is a multiple of 64 and
   that uses no subgroup operations, so its results can't depend on the wave size,
@@ -81,20 +86,33 @@ the Vulkan functions it gives the DLL:
   `subgroupSizeControl` on the application's device. `FFXVK_WAVE64=0` leaves wave
   sizes alone.
 
-The probe's output is byte-identical with and without both changes, for FSR 3 and
+The probe's output is byte-identical with and without these changes, for FSR 3 and
 FSR 4 over three frames. Measured on an RX 7900 XTX (Mesa RADV 26.2.6), upscaling to
-3840x2160 in Quality mode inside a game:
+3840x2160 in Quality mode inside a game; GPU time from timestamps around the FSR
+dispatch:
 
 | GPU time per frame | FSR 3.1.6 | FSR 4.1.2 |
 |---|---|---|
 | Before | 1.15 ms | 4.3 ms |
 | Cached memory types | | 3.2 ms |
 | Cached memory and wave64 | 0.7 ms | 2.7 ms |
-| D3D12 version through vkd3d-proton, same GPU (estimated from frame times) | ~0.4 ms | ~2.2 ms |
+| All three | 0.7 ms | 2.6 ms |
 
-Running the DLLs as Windows code under Wine, without this library, gave the same
-timings as the "Before" row, so the remaining gap is in the Vulkan path itself.
-`FFXVK_DEBUG=1` logs each moved allocation and each pipeline made wave64.
+Against the same SDK's D3D12 version under Proton (vkd3d-proton, same GPU and
+driver), FSR's cost measured the same way for both (its frame time minus the
+native frame time; the D3D12 window was 3840x1999, scaled to 3840x2160), averaged
+over five views:
+
+| Frame-time cost | FSR 3 | FSR 4 |
+|---|---|---|
+| This library, all three changes | 0.30 ms (3.1.6) | 2.27 ms (4.1.2) |
+| D3D12 through vkd3d-proton | 0.33 ms (3.1.5) | 2.12 ms (4.1.1) |
+| This library before the changes | ~0.8 ms | ~4.0 ms |
+
+Running the DLLs as Windows code under Wine, without this library, cost the same as
+the "before" rows: the changes, not the bridge, close the gap. The D3D12 FSR 4 is
+the SDK's 4.1.1, not the driver's 4.1.2. `FFXVK_DEBUG=1` logs each moved allocation
+and each pipeline made wave64.
 
 The current Vulkan thunk table and message/allocation callback bridges assume one
 application device and one callback set. Concurrent independent devices/contexts,
