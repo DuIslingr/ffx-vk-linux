@@ -42,6 +42,7 @@ FFXVK_DRIVER_DLL=/path/to/amdvkffx64.dll \
   --output /tmp/fsr4.ppm
 ```
 
+`--model lite` runs FSR 4 Lite, chosen after the DLLs load (see "FSR 4 Lite").
 `--validate` requires `VK_LAYER_KHRONOS_validation`. GPU access is necessary;
 a sandbox exposing only llvmpipe cannot exercise the AMD provider. `FFXVK_DEBUG=1`
 logs imports and provider requests. `FFXVK_SHADER_DUMP=/existing/directory` writes
@@ -172,6 +173,19 @@ in place of the real one, and the DLL runs Lite. Nothing else changes: the DLL's
 Vulkan queries still see the real GPU, the version stays "4.1.2", and FSR 3 and 2 are
 as before. Without the variable, or with any other value, the real family is reported.
 
+A program can also change the model while it runs, for example from a graphics
+option: **`ffxvkFsr4Model("lite")`** (or `NULL` for the GPU's own) sets the model for
+the contexts made after the call, and a context keeps the model it was made with, so
+the program destroys its FSR 4 context and makes it again. Contexts of both models can
+be live together. The variable is this setting's starting value.
+
+The driver DLL settles on its model once, so the second model gets a second instance of
+`amdvkffx64.dll` (one more copy of the 72 MB DLL in memory, loaded when that model is first asked for),
+which is told the other family. AMD's SDK also keeps one provider per version, so the
+second instance's FSR 4 is given a version id of its own; the bridge names it when it
+makes a context of that model and leaves it out of the version list, so a program still
+sees FSR 4.1.2 once.
+
 Lite's picture is not the full model's: it is AMD's own trade of quality for time.
 RX 7900 XTX, RADV, Quality mode, FSR 4.1.2 on its own (`ffxasync`), and inside a game
 at 4K (GPU timestamps around the dispatch; 329 -> 466 frames per second there):
@@ -183,7 +197,8 @@ at 4K (GPU timestamps around the dispatch; 329 -> 466 frames per second there):
 | 1920x1080 | 0.68 ms | **0.39 ms** |
 | 3840x2160, in a game | 2.27 ms | **1.36 ms** |
 
-Validation is clean with it, and linear images make no difference to Lite. Which
+Validation is clean with it (also with contexts of both models live), and linear images
+make no difference to Lite. Which
 model a family gets is the driver DLL's decision and may change with its version:
 checked with `amdvkffx64.dll` of Adrenalin 26.10.1.
 

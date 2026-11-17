@@ -44,11 +44,19 @@ PFN_vkGetDeviceProcAddr realDeviceProcAddr;
 PFN_vkGetInstanceProcAddr realInstanceProcAddr;
 std::mutex fillMutex;
 using UpdateProvider = int32_t __attribute__((ms_abi)) (*)(void*, uint32_t);
-UpdateProvider driverProvider = nullptr;
+// The driver DLL's entry, one instance of the DLL per FSR 4 model (it settles on its model once): [0] the GPU's own,
+// [1] FSR 4 Lite. A thread's calls go to the instance of the model it is working for (setModel).
+UpdateProvider driverProviders[2] = {};
+int firstModel = -1;                    // the model of the instance loaded first: its provider keeps AMD's version id
+std::atomic<uint64_t> secondId{0};      // the version id the second instance's provider was given (0: none yet)
+thread_local int threadModel = 0;
+UpdateProvider driverProvider() {
+    return driverProviders[threadModel] ? driverProviders[threadModel] : driverProviders[!threadModel];
+}
 
 __attribute__((ms_abi)) void msProperties2(VkPhysicalDevice device, VkPhysicalDeviceProperties2* properties) {
     r_vkGetPhysicalDeviceProperties2(device, properties);
-    if (!driverProvider) return;
+    if (!driverProvider()) return;
     identifyDriverAdapter(device, r_vkGetPhysicalDeviceProperties2, properties);
 }
 
@@ -277,7 +285,7 @@ __attribute__((ms_abi)) VkResult msCreateImage(VkDevice device, const VkImageCre
 __attribute__((ms_abi)) VkResult msCreateShaderModule(VkDevice device,
         const VkShaderModuleCreateInfo* info, const VkAllocationCallbacks* allocator, VkShaderModule* out) {
     if (!info || !info->pCode || info->codeSize % sizeof(uint32_t)) return VK_ERROR_INVALID_SHADER_NV;
-    auto rewritten = rewriteHalfImageTypes({info->pCode, info->codeSize / sizeof(uint32_t)}, driverProvider != nullptr);
+    auto rewritten = rewriteHalfImageTypes({info->pCode, info->codeSize / sizeof(uint32_t)}, driverProvider() != nullptr);
     if (rewritten.status == ImageRewriteStatus::Invalid) {
         std::fprintf(stderr, "ffx-vk-linux: shader normalization failed: %s\n", rewritten.error.c_str());
         return VK_ERROR_INVALID_SHADER_NV;
@@ -299,13 +307,22 @@ __attribute__((ms_abi)) VkResult msCreateShaderModule(VkDevice device,
     return result;
 }
 
+// The SDK's request for the driver's provider (made with every query and context): answered by the instance of the
+// thread's model. The SDK keeps one provider per version id, the first it is given, so the second instance's would
+// never be used: its id gets a bit no version number has (0x800 of the patch number), which makes it a version of its
+// own to the SDK, one a context is made with by naming it (ffxOverrideVersion; ffxvk.cpp does that and keeps it out of
+// the program's version list).
 __attribute__((ms_abi)) int32_t msUpdateProvider(VkDevice, void* data, uint32_t size) {
-    const int32_t result = driverProvider(data, size);
-    if (verbose()) {
-        uint64_t id = 0;
-        if (data && size >= 24) std::memcpy(&id, static_cast<const char*>(data) + 16, 8);
-        std::fprintf(stderr, "ffx-vk-linux: driver provider request (%u bytes): 0x%08x, id %016llx\n", size, uint32_t(result), (unsigned long long)id);
+    const UpdateProvider provider = driverProvider();
+    const int32_t result = provider(data, size);
+    uint64_t id = 0;
+    if (data && size >= 24) std::memcpy(&id, static_cast<const char*>(data) + 16, 8);
+    if (result == 0 && id && firstModel >= 0 && provider == driverProviders[!firstModel]) {
+        id |= 0x800;
+        std::memcpy(static_cast<char*>(data) + 16, &id, 8);
+        secondId = id;
     }
+    if (verbose()) std::fprintf(stderr, "ffx-vk-linux: driver provider request (%u bytes): 0x%08x, id %016llx\n", size, uint32_t(result), (unsigned long long)id);
     return result;
 }
 
@@ -325,7 +342,7 @@ PFN_vkVoidFunction special(const char* name) {
 
 // the DLL's vkGetDeviceProcAddr: the real function recorded into its thunk, the thunk given
 __attribute__((ms_abi)) PFN_vkVoidFunction msGetDeviceProcAddr(VkDevice device, const char* name) {
-    if (driverProvider && std::strcmp(name, "vkUpdateFfxApiProviderAMD") == 0)
+    if (driverProvider() && std::strcmp(name, "vkUpdateFfxApiProviderAMD") == 0)
         return reinterpret_cast<PFN_vkVoidFunction>(&msUpdateProvider);
     const VkThunk* t = thunkOf(name);
     PFN_vkVoidFunction real = realDeviceProcAddr ? realDeviceProcAddr(device, name) : nullptr;
@@ -398,7 +415,14 @@ PFN_vkVoidFunction msGetInstanceProcAddrFor(PFN_vkGetInstanceProcAddr real) {
     return reinterpret_cast<PFN_vkVoidFunction>(&msGetInstanceProcAddr);
 }
 
-void setDriverProvider(void* update) { driverProvider = reinterpret_cast<UpdateProvider>(update); }
+void setDriverProvider(int model, void* update) {
+    driverProviders[model != 0] = reinterpret_cast<UpdateProvider>(update);
+    if (firstModel < 0) firstModel = model != 0;
+}
+int firstDriverModel() { return firstModel; }
+uint64_t secondProviderId() { return secondId; }
+void setModel(int model) { threadModel = model != 0; }
+int model() { return threadModel; }
 void setUpscaler(int major, VkPhysicalDevice device) { upscalerMajor = major; upscalerDevice = device; }
 
 } // namespace ffxvk

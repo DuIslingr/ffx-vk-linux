@@ -1,4 +1,5 @@
 #include "adapter.h"
+#include "vk_thunks.h"
 #include <amdgpu.h>
 #include <xf86drm.h>
 #include <fcntl.h>
@@ -80,15 +81,16 @@ void identifyDriverAdapter(VkPhysicalDevice physical, PFN_vkGetPhysicalDevicePro
                 selected.family = info.family_id;
                 selected.revision = info.chip_external_rev;
                 selected.valid = true;
-                // FFXVK_FSR4_MODEL=lite (an opt-in): AMD's smaller FSR 4 network, FSR 4 Lite. The driver DLL holds it
-                // beside the full models and takes the one for the ASIC family it is told here; it gives Lite to its
-                // integrated GPUs, so this reports one of those (GC 11.5.0, the Radeon 890M's) in place of the real
-                // family. Only this answer changes: the DLL's Vulkan queries still see the real GPU. On an RX 7900 XTX
-                // at 4K, FSR 4 takes 1.39 ms with Lite against 2.31 ms; the picture is Lite's, not the full model's.
-                if (const char* model = std::getenv("FFXVK_FSR4_MODEL"); model && std::strcmp(model, "lite") == 0) {
+                // FSR 4 Lite (an opt-in: FFXVK_FSR4_MODEL=lite, ffxvkFsr4Model): AMD's smaller FSR 4 network. The driver
+                // DLL holds it beside the full models and takes the one for the ASIC family it is told here; it gives
+                // Lite to its integrated GPUs, so the instance of the DLL kept for Lite is told one of those (GC 11.5.0,
+                // the Radeon 890M's) in place of the real family. Only this answer changes: the DLL's Vulkan queries
+                // still see the real GPU. On an RX 7900 XTX at 4K, FSR 4 takes 1.39 ms with Lite against 2.31 ms; the
+                // picture is Lite's, not the full model's.
+                if (model() == 1) {
                     selected.family = 150;   // AMDGPU_FAMILY_GC_11_5_0
                     selected.revision = 0x10;
-                    if (std::getenv("FFXVK_DEBUG")) std::fprintf(stderr, "ffx-vk-linux: FFXVK_FSR4_MODEL=lite: family %x revision %x reported to the driver DLL\n", selected.family, selected.revision);
+                    if (std::getenv("FFXVK_DEBUG")) std::fprintf(stderr, "ffx-vk-linux: FSR 4 Lite: family %x revision %x reported to the driver DLL\n", selected.family, selected.revision);
                 }
                 if (std::getenv("FFXVK_DEBUG")) std::fprintf(stderr, "ffx-vk-linux: DRM adapter %s family %x revision %x\n", path, selected.family, selected.revision);
             }

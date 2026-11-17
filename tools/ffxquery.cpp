@@ -40,6 +40,7 @@ int main(int argc, char** argv) {
     bool requireFsr4 = false, dispatch = false, validate = false, computeQueue = false;
     const char* directory = nullptr;
     const char* output = nullptr;
+    const char* model = nullptr;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--require-fsr4") requireFsr4 = true;
@@ -47,11 +48,12 @@ int main(int argc, char** argv) {
         else if (arg == "--validate") validate = true;
         else if (arg == "--compute-queue") computeQueue = true;
         else if (arg == "--output" && i + 1 < argc) { output = argv[++i]; dispatch = true; }
+        else if (arg == "--model" && i + 1 < argc) model = argv[++i];
         else if (!directory && arg[0] != '-') directory = argv[i];
         else { std::fprintf(stderr, "unknown or incomplete argument: %s\n", argv[i]); return 2; }
     }
     if (!directory) {
-        std::fprintf(stderr, "ffxquery <SDK DLL directory> [--require-fsr4] [--dispatch] [--validate] [--compute-queue] [--output image.ppm]\n");
+        std::fprintf(stderr, "ffxquery <SDK DLL directory> [--require-fsr4] [--dispatch] [--validate] [--compute-queue] [--output image.ppm] [--model lite]\n");
         return 2;
     }
     Vulkan vk;
@@ -141,6 +143,8 @@ int main(int argc, char** argv) {
     }
     if (ffxvkLoad(directory) != 0) { std::fprintf(stderr, "ffxvkLoad: %s\n", ffxvkError()); return 1; }
     std::printf("AMD's DLL loaded\n");
+    // (--model lite: FSR 4 Lite, chosen after the load as a program's option would - the driver DLL's second instance)
+    if (model && ffxvkFsr4Model(model) != 0) { std::fprintf(stderr, "ffxvkFsr4Model: %s\n", ffxvkError()); return 1; }
     VkDeviceContext dc{vk.device, gpu, vkGetDeviceProcAddr};
     uint64_t count = 0;
     ffxQueryDescGetVersions v{};

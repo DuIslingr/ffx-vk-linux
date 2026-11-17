@@ -675,6 +675,16 @@ void setDllDirectory(const std::string& dir) {
 }
 
 void* loadDll(const std::string& name) { return loadLibrary(name); }
+void* loadDllInstance(const std::string& path) {
+    std::string err;
+    PeImage* img = loadPe(path, resolveImport, &err);
+    if (!img || !runInit(*img, &err)) {
+        std::fprintf(stderr, "ffx-vk-linux: %s\n", err.c_str());
+        return nullptr;
+    }
+    LOG("loaded %s once more at %p\n", img->path.c_str(), static_cast<void*>(img->base));
+    return img->base;
+}
 
 std::string fromUtf16(const char16_t* s) { return utf16ToUtf8(s); }
 

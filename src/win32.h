@@ -13,6 +13,8 @@ void* standIn(const std::string& dll, const std::string& name);
 void setDllDirectory(const std::string& dir);
 // LoadLibrary: one of AMD's from that directory (its base: its handle), mapped and started
 void* loadDll(const std::string& name);
+// one more instance of a DLL (an absolute path), whether or not it is loaded already: its own image, with its own data
+void* loadDllInstance(const std::string& path);
 std::string fromUtf16(const char16_t* s);
 
 } // namespace ffxvk

@@ -8,8 +8,11 @@
 #include "vk_thunks.h"
 #include "win32.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cwchar>
 #include <filesystem>
 #include <mutex>
@@ -33,6 +36,38 @@ struct Entries {
 } entries;
 std::string error;
 std::mutex loadMutex;
+
+// ---- FSR 4's model (ffxvkFsr4Model): 0 the GPU's own, 1 FSR 4 Lite
+// The driver DLL settles on a model the first time it is asked which GPU it runs on, so each model has its own instance
+// of the DLL (the second one loaded when its model is first asked for), told its own GPU family (adapter.cpp).
+std::atomic<int> wantedModel{0};
+bool modelChosen = false;        // by ffxvkFsr4Model (else $FFXVK_FSR4_MODEL when the DLLs load)
+std::string driverFile;          // the driver DLL (absolute; empty: none)
+bool driverLoaded[2] = {};
+
+int modelNamed(const char* name) { return name && std::strcmp(name, "lite") == 0 ? 1 : 0; }
+
+// the driver DLL's instance for `model` (loadMutex held); false: `error` says why
+bool loadDriver(int model) {
+    if (driverLoaded[model]) return true;
+    if (driverFile.empty()) return error = "no driver DLL (amdvkffx64.dll): no FSR 4", false;
+    ffxvk::setModel(model);   // (the instance's first question about the GPU may come as it starts)
+    void* module = driverLoaded[!model] ? ffxvk::loadDllInstance(driverFile) : ffxvk::loadDll(driverFile);
+    ffxvk::setModel(0);
+    void* update = nullptr;
+    for (auto* image : ffxvk::loadedImages())
+        if (image->base == module) update = image->exportOf("UpdateFfxApiProvider");
+    if (!update) return error = "cannot load the driver provider from " + driverFile, false;
+    ffxvk::setDriverProvider(model, update);
+    driverLoaded[model] = true;
+    return true;
+}
+
+// the thread's model for the length of one call into the DLLs
+struct ModelScope {
+    explicit ModelScope(int model) { ffxvk::setModel(model); }
+    ~ModelScope() { ffxvk::setModel(0); }
+};
 
 // ---- the bridges
 
@@ -112,14 +147,44 @@ struct Swaps {
     }
 };
 
-// ---- which upscaler a context is (for vk_thunks' per-version changes)
+// ---- which upscaler a context is (for vk_thunks' per-version changes and FSR 4's model)
 // The context a description chain will make: the version it names (ffxOverrideVersion), else the SDK's first choice
 // (the first of its version list), as the major version of its name ("4.1.2": 4). 0: not an upscaler, or unknown.
-struct Upscaler { int major = 0; VkPhysicalDevice device = VK_NULL_HANDLE; };
+// `version`: the id the SDK must be asked for instead (0: as the program asked) - with both instances of the driver DLL
+// in use the SDK lists FSR 4 twice, the second instance's under an id of its own (vk_thunks.cpp, msUpdateProvider), and
+// would take whichever comes first.
+struct Upscaler { int major = 0; VkPhysicalDevice device = VK_NULL_HANDLE; int model = 0; uint64_t version = 0; };
 std::mutex upscalerMutex;
 std::vector<std::pair<ffxContext, Upscaler>> upscalers;   // the live contexts
 
-Upscaler upscalerOf(ffxCreateContextDescHeader* desc) {
+// the second instance's version as the SDK lists it (the driver's own bit 31 aside)
+bool isSecond(uint64_t id) {
+    const uint64_t second = ffxvk::secondProviderId();
+    return second && (id | 0x80000000ull) == (second | 0x80000000ull);
+}
+// what the program is told in its place: the first instance's FSR 4 (the same version; set when a context is made)
+uint64_t firstVersionId = 0;
+const char* firstVersionName = nullptr;
+
+// the SDK's versions for a kind of context, the second instance's included (false: the query failed)
+struct Versions { uint64_t ids[32]{}; const char* names[32]{}; uint64_t count = 0; };
+bool versionsOf(const VkDeviceContext* device, uint64_t createDescType, Versions& out) {
+    VkDeviceContext copy{};   // (its function pointer is swapped for the query, the program's left alone)
+    if (device) copy = *device;
+    ffxQueryDescGetVersions v{};
+    v.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+    v.createDescType = createDescType;
+    v.device = device ? &copy : nullptr;
+    out.count = 32;
+    v.outputCount = &out.count;
+    v.versionIds = out.ids;
+    v.versionNames = out.names;
+    Swaps s;
+    s.chain(&v.header);
+    return entries.query(nullptr, &v.header) == FFX_API_RETURN_OK && out.count <= 32;
+}
+
+Upscaler upscalerOf(ffxCreateContextDescHeader* desc, int model) {
     VkDeviceContext* device = nullptr;
     uint64_t wanted = 0;
     bool upscale = false;
@@ -128,29 +193,26 @@ Upscaler upscalerOf(ffxCreateContextDescHeader* desc) {
         else if (h->type == FFX_API_DESC_TYPE_OVERRIDE_VERSION) wanted = reinterpret_cast<ffxOverrideVersion*>(h)->versionId;
         else if (h->type == FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE) upscale = true;
     }
-    if (!upscale || !device || !device->vkPhysicalDevice) return {};
-    uint64_t ids[16]{};
-    const char* names[16]{};
-    uint64_t count = 16;
-    VkDeviceContext copy = *device;   // (its function pointer is swapped for the query, the program's left alone)
-    ffxQueryDescGetVersions v{};
-    v.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
-    v.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-    v.device = &copy;
-    v.outputCount = &count;
-    v.versionIds = ids;
-    v.versionNames = names;
-    {
-        Swaps s;
-        s.chain(&v.header);
-        if (entries.query(nullptr, &v.header) != FFX_API_RETURN_OK || !count || count > 16) return {};
+    Upscaler u;
+    u.model = model;
+    if (!upscale || !device || !device->vkPhysicalDevice) return u;
+    Versions v;
+    if (!versionsOf(device, FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, v) || !v.count) return u;
+    // the program's choice among the versions it knows of (the second instance's isn't one)
+    uint64_t id = 0, second = 0;
+    const char* name = nullptr;
+    for (uint64_t i = 0; i < v.count; ++i) {
+        if (isSecond(v.ids[i])) { second = v.ids[i]; continue; }
+        if (!name && (!wanted || v.ids[i] == wanted)) id = v.ids[i], name = v.names[i];
     }
-    const char* name = names[0];
-    if (wanted) {
-        name = nullptr;
-        for (uint64_t i = 0; i < count; ++i) if (ids[i] == wanted) name = names[i];
+    u.major = name ? std::atoi(name) : 0;
+    u.device = device->vkPhysicalDevice;
+    if (u.major == 4 && second) {
+        firstVersionId = id;
+        firstVersionName = name;
+        u.version = model == ffxvk::firstDriverModel() ? id : second;
     }
-    return {name ? std::atoi(name) : 0, device->vkPhysicalDevice};
+    return u;
 }
 
 // the thread's upscaler for the length of one call into the DLL
@@ -208,30 +270,65 @@ int ffxvkLoad(const char* directory) {
                                             : std::filesystem::path(directory) / "amdvkffx64.dll";
     std::error_code ec;
     if (driverPath || std::filesystem::exists(driver, ec)) {
-        void* module = ffxvk::loadDll(std::filesystem::absolute(driver).string());
-        void* update = nullptr;
-        for (auto* image : ffxvk::loadedImages())
-            if (image->base == module) update = image->exportOf("UpdateFfxApiProvider");
-        if (!update) {
+        driverFile = std::filesystem::absolute(driver).string();
+        if (!modelChosen) wantedModel = modelNamed(std::getenv("FFXVK_FSR4_MODEL"));
+        if (!loadDriver(wantedModel)) {
             entries = {};
-            return error = "cannot load the driver provider from " + driver.string(), 4;
+            driverFile.clear();
+            return 4;
         }
-        ffxvk::setDriverProvider(update);
     }
     return 0;
 }
 
 const char* ffxvkError(void) { return error.c_str(); }
 
+int ffxvkFsr4Model(const char* model) {
+    std::lock_guard<std::mutex> lock(loadMutex);
+    const int m = modelNamed(model);
+    if (entries.createContext) {   // (before the DLLs load: remembered for then)
+        ffxvk::ensureThread();
+        if (!loadDriver(m)) return 1;
+    }
+    modelChosen = true;
+    wantedModel = m;
+    return 0;
+}
+
 ffxReturnCode_t ffxCreateContext(ffxContext* context, ffxCreateContextDescHeader* desc, const ffxAllocationCallbacks* memCb) {
     if (!ready()) return FFX_API_RETURN_ERROR;
     ffxvk::ensureThread();
-    const Upscaler upscaler = upscalerOf(desc);
+    const int model = wantedModel;
+    ModelScope modelScope(model);
+    const Upscaler upscaler = upscalerOf(desc, model);
     UpscalerScope scope(upscaler);
-    Swaps s;
-    s.chain(desc);
-    const ffxReturnCode_t result = entries.createContext(context, desc, bridgeAlloc(memCb));
-    if (result == FFX_API_RETURN_OK && context && upscaler.major) {
+    // the version named for the SDK where it must be (see Upscaler): in the program's own override, else in one of ours
+    // put behind the first description; both as they were after the call
+    ffxOverrideVersion ours{};
+    ffxOverrideVersion* theirs = nullptr;
+    uint64_t theirVersion = 0;
+    if (upscaler.version && desc) {
+        for (ffxApiHeader* h = desc; h && !theirs; h = h->pNext)
+            if (h->type == FFX_API_DESC_TYPE_OVERRIDE_VERSION) theirs = reinterpret_cast<ffxOverrideVersion*>(h);
+        if (theirs) {
+            theirVersion = theirs->versionId;
+            theirs->versionId = upscaler.version;
+        } else {
+            ours.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+            ours.header.pNext = desc->pNext;
+            ours.versionId = upscaler.version;
+            desc->pNext = &ours.header;
+        }
+    }
+    ffxReturnCode_t result;
+    {
+        Swaps s;
+        s.chain(desc);
+        result = entries.createContext(context, desc, bridgeAlloc(memCb));
+    }
+    if (theirs) theirs->versionId = theirVersion;
+    else if (ours.header.type) desc->pNext = ours.header.pNext;
+    if (result == FFX_API_RETURN_OK && context && (upscaler.major || upscaler.model)) {
         std::lock_guard<std::mutex> lock(upscalerMutex);
         upscalers.push_back({*context, upscaler});
     }
@@ -241,6 +338,7 @@ ffxReturnCode_t ffxCreateContext(ffxContext* context, ffxCreateContextDescHeader
 ffxReturnCode_t ffxDestroyContext(ffxContext* context, const ffxAllocationCallbacks* memCb) {
     if (!ready()) return FFX_API_RETURN_ERROR;
     ffxvk::ensureThread();
+    ModelScope modelScope(upscalerOf(context).model);
     if (context) {
         std::lock_guard<std::mutex> lock(upscalerMutex);
         for (auto it = upscalers.begin(); it != upscalers.end(); ++it) if (it->first == *context) { upscalers.erase(it); break; }
@@ -251,6 +349,7 @@ ffxReturnCode_t ffxDestroyContext(ffxContext* context, const ffxAllocationCallba
 ffxReturnCode_t ffxConfigure(ffxContext* context, const ffxConfigureDescHeader* desc) {
     if (!ready()) return FFX_API_RETURN_ERROR;
     ffxvk::ensureThread();
+    ModelScope modelScope(context && *context ? upscalerOf(context).model : wantedModel.load());
     Swaps s;
     s.chain(const_cast<ffxConfigureDescHeader*>(desc));
     return entries.configure(context, desc);
@@ -259,15 +358,47 @@ ffxReturnCode_t ffxConfigure(ffxContext* context, const ffxConfigureDescHeader* 
 ffxReturnCode_t ffxQuery(ffxContext* context, ffxQueryDescHeader* desc) {
     if (!ready()) return FFX_API_RETURN_ERROR;
     ffxvk::ensureThread();
-    Swaps s;
-    s.chain(desc);
-    return entries.query(context, desc);
+    ModelScope modelScope(context && *context ? upscalerOf(context).model : wantedModel.load());
+    // The version list: the second instance's FSR 4 left out (the program picks the model with ffxvkFsr4Model, not by
+    // version). Asked for here with room for all, as the program's own count is one short of the SDK's.
+    if (desc && desc->type == FFX_API_QUERY_DESC_TYPE_GET_VERSIONS && ffxvk::firstDriverModel() >= 0 && driverLoaded[!ffxvk::firstDriverModel()]) {
+        auto* q = reinterpret_cast<ffxQueryDescGetVersions*>(desc);
+        Versions v;
+        if (q->outputCount && versionsOf(static_cast<const VkDeviceContext*>(q->device), q->createDescType, v)) {
+            const uint64_t room = q->versionIds || q->versionNames ? *q->outputCount : 0;
+            uint64_t n = 0;
+            for (uint64_t i = 0; i < v.count; ++i) {
+                if (isSecond(v.ids[i])) continue;
+                if (n < room) {
+                    if (q->versionIds) q->versionIds[n] = v.ids[i];
+                    if (q->versionNames) q->versionNames[n] = v.names[i];
+                }
+                ++n;
+            }
+            *q->outputCount = q->versionIds || q->versionNames ? std::min(n, room) : n;
+            return FFX_API_RETURN_OK;
+        }
+    }
+    ffxReturnCode_t result;
+    {
+        Swaps s;
+        s.chain(desc);
+        result = entries.query(context, desc);
+    }
+    // a context of the second instance: the version the program knows it by
+    if (result == FFX_API_RETURN_OK && desc && desc->type == FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION) {
+        auto* q = reinterpret_cast<ffxQueryGetProviderVersion*>(desc);
+        if (isSecond(q->versionId) && firstVersionId) q->versionId = firstVersionId, q->versionName = firstVersionName;
+    }
+    return result;
 }
 
 ffxReturnCode_t ffxDispatch(ffxContext* context, const ffxDispatchDescHeader* desc) {
     if (!ready()) return FFX_API_RETURN_ERROR;
     ffxvk::ensureThread();
-    UpscalerScope scope(upscalerOf(context));   // (images the DLL makes on a first dispatch)
+    const Upscaler upscaler = upscalerOf(context);
+    ModelScope modelScope(upscaler.model);
+    UpscalerScope scope(upscaler);   // (images the DLL makes on a first dispatch)
     Swaps s;
     s.chain(const_cast<ffxDispatchDescHeader*>(desc));
     return entries.dispatch(context, desc);

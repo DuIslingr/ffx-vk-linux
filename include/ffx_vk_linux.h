@@ -26,6 +26,14 @@ extern "C" {
 __attribute__((visibility("default"))) int ffxvkLoad(const char* directory);
 __attribute__((visibility("default"))) const char* ffxvkError(void);
 
+// FSR 4's model for the contexts made from now on: "lite" FSR 4 Lite (AMD's smaller network, the one it gives its
+// integrated GPUs: faster, its own picture), NULL or anything else the GPU's own. Contexts keep the model they were made
+// with, so a program can change it while it runs: destroy the context and make it again. Starts as $FFXVK_FSR4_MODEL
+// says (unset: the GPU's own). Call it with no other call into this library running.
+// 0 done, else nonzero and nothing changed - ffxvkError says why (no driver DLL, or it can't be loaded once more:
+// each model has its own instance of amdvkffx64.dll, the second one loaded when first asked for)
+__attribute__((visibility("default"))) int ffxvkFsr4Model(const char* model);
+
 #ifdef __cplusplus
 }
 #endif
