@@ -4,16 +4,20 @@ Run AMD's Windows FidelityFX / FSR Vulkan DLLs in a **native x86-64 Linux Vulkan
 program**, without Wine. The library provides a small PE loader, Windows runtime
 services, calling-convention bridges, and AMD's public FSR API.
 
-**Experimental FSR 4.1.2 support:** the SDK's Vulkan provider request is bridged to
-`amdvkffx64.dll` from AMD's Windows driver. Tested with SDK 2.4.0, Adrenalin 26.10.1,
-an RX 7900 XTX and Mesa RADV 26.2.6. The probe checks the selected provider and can
+**Experimental FSR 4.1.2 support**, from AMD's SDK DLLs alone: the SDK's
+`amd_fidelityfx_upscaler_vk.dll` carries FSR 4 itself (the full INT8 network, AMD's
+RX 6000 version of it, and FSR 4 Lite), and the bridge answers the questions it asks
+about the GPU. `amdvkffx64.dll` from AMD's Windows driver is optional: when present,
+the SDK's Vulkan provider request is bridged to it and the SDK uses its FSR 4 instead
+(the same 4.1.2, the same picture). Tested with SDK 2.4.0, Adrenalin 26.10.1, an
+RX 7900 XTX and Mesa RADV 26.2.6. The probe checks the selected provider and can
 submit three upscale frames and verify their pixel readback. This is an initial
 headless correctness test; game integration and temporal image quality need further
 validation. See [the driver compatibility notes](docs/driver-provider.md).
 
-Without the optional driver DLL, the SDK supplies its FSR 3.1.6 / 2.3.4 providers.
-Unsupported hardware can also fall back to those providers. Use `--require-fsr4`
-to make the probe reject that fallback.
+The SDK also supplies its FSR 3.1.6 / 2.3.4 providers, and GPUs its FSR 4 does not
+take (see "FSR 4 from the SDK's DLL") fall back to those. Use `--require-fsr4` to make
+the probe reject that fallback.
 
 ## Build
 
@@ -32,13 +36,13 @@ ctest --test-dir build --output-on-failure
 Supply your own AMD DLLs; they are excluded from version control:
 
 - SDK 2.4.0: `amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll`
-  from `Kits/FidelityFX/signedbin`.
-- For FSR 4: `amdvkffx64.dll` from the Adrenalin Windows driver. Put it beside
-  the SDK DLLs, or set `FFXVK_DRIVER_DLL` to its absolute path.
+  from `Kits/FidelityFX/signedbin`. These are enough for FSR 4 and FSR 3; the SDK's
+  licence lists them among its MIT-licensed files.
+- Optional: `amdvkffx64.dll` from the Adrenalin Windows driver, beside the SDK DLLs
+  or named by `FFXVK_DRIVER_DLL` (an absolute path). The SDK then takes FSR 4 from it.
 
 ```sh
-FFXVK_DRIVER_DLL=/path/to/amdvkffx64.dll \
-  build/ffxquery /path/to/sdk-dlls --require-fsr4 --dispatch --validate \
+build/ffxquery /path/to/sdk-dlls --require-fsr4 --dispatch --validate \
   --output /tmp/fsr4.ppm
 ```
 
@@ -163,10 +167,37 @@ measurable time. Proton players of D3D12 games with FSR 4 on RADV gain from the 
 too. The D3D12 FSR 4 is the SDK's 4.1.1, not the driver's 4.1.2. `FFXVK_DEBUG=1` logs each moved allocation,
 each pipeline made wave64 and each image made linear.
 
+## FSR 4 from the SDK's DLL
+
+The SDK's `amd_fidelityfx_upscaler_vk.dll` registers four FSR 4 providers under one
+version id (4.1.2, `f5a5ca1e01001002`, the driver's FSR 4 has the same): an FP8 one,
+the full INT8 network, AMD's RX 6000 version of it, and Lite. Each checks the GPU it
+runs on and the first that takes it is used. To find the GPU the DLL needs a valid
+device LUID in `VkPhysicalDeviceIDProperties`, then asks `D3DKMTEnumAdapters` and
+`D3DKMTQueryAdapterInfo` for the ASIC family and revision: the same questions as the
+driver DLL, answered the same way (a LUID made from the device UUID, and the family
+and revision the amdgpu kernel driver reports). The SDK asks the driver's provider
+first, so with `amdvkffx64.dll` present its FSR 4 is used.
+
+Which GPUs the DLL's own checks take, as read from its code (only the RX 7900 XTX
+was run):
+
+| ASIC family (amdgpu) | Provider |
+|---|---|
+| 0x91, GC 11.0.0: RX 7000 | full INT8 network |
+| 0x8F, revisions 0x28 to 0x4F: RX 6000 | AMD's RX 6000 version of it |
+| 0x96, GC 11.5.0: Radeon 890M and relatives | Lite (some revisions: the full network) |
+
+On the RX 7900 XTX the SDK DLL's FSR 4 gives the driver DLL's picture byte for byte
+(the probe's three frames, full and Lite), with the same GPU time, and validation is
+clean. The SPIR-V fixes first made for the driver's FSR 4 shaders apply to every
+shader now; FSR 3's shaders come out of them unchanged.
+
 ## FSR 4 Lite (opt-in)
 
-AMD's driver DLL also holds FSR 4 Lite, a smaller network that AMD gives its
-integrated GPUs, and picks the model from the GPU family it is told. With
+AMD's DLLs (the SDK's upscaler DLL and the driver DLL) also hold FSR 4 Lite, a
+smaller network that AMD gives its integrated GPUs, and pick the model from the GPU
+family they are told. With
 **`FFXVK_FSR4_MODEL=lite`** in the environment before the DLLs load, the bridge
 answers that question with an integrated GPU's family (GC 11.5.0, the Radeon 890M's)
 in place of the real one, and the DLL runs Lite. Nothing else changes: the DLL's
@@ -179,7 +210,11 @@ the contexts made after the call, and a context keeps the model it was made with
 the program destroys its FSR 4 context and makes it again. Contexts of both models can
 be live together. The variable is this setting's starting value.
 
-The driver DLL settles on its model once, so the second model gets a second instance of
+Without the driver DLL, one instance of the SDK's DLL serves both models. It keeps the
+GPU it identified per adapter LUID, so Lite's questions come with a LUID of their own
+and are answered with the integrated family.
+
+With the driver DLL, which settles on its model once, the second model gets a second instance of
 `amdvkffx64.dll` (one more copy of the 72 MB DLL in memory, loaded when that model is first asked for),
 which is told the other family. AMD's SDK also keeps one provider per version, so the
 second instance's FSR 4 is given a version id of its own; the bridge names it when it
@@ -199,8 +234,9 @@ at 4K (GPU timestamps around the dispatch; 329 -> 466 frames per second there):
 
 Validation is clean with it (also with contexts of both models live), and linear images
 make no difference to Lite. Which
-model a family gets is the driver DLL's decision and may change with its version:
-checked with `amdvkffx64.dll` of Adrenalin 26.10.1.
+model a family gets is AMD's DLLs' decision and may change with their versions:
+checked with the SDK 2.4.0 upscaler DLL and `amdvkffx64.dll` of Adrenalin 26.10.1, which
+give Lite the same picture byte for byte.
 
 ## Faster shaders: related work
 
@@ -208,7 +244,10 @@ checked with `amdvkffx64.dll` of Adrenalin 26.10.1.
 (GPL) rewrites FSR 4's slowest INT8 shaders with byte-identical output, and has
 faster builds with a different picture. Its published rewrites are for the D3D12
 DLL's shaders as vkd3d-proton translates them, not for the Vulkan DLL's shaders this
-bridge loads; its notes on where FSR 4's time goes are the best there are. On an
+bridge loads; its notes on where FSR 4's time goes are the best there are. A test
+build of the SDK's Vulkan upscaler DLL with its exact rewrites is in its timing kit
+(November 2026, not in a release); this bridge's SDK-only path loads that DLL's FSR 4,
+but the test build has not been run here. On an
 RX 7900 XTX, linear images (above) already bring FSR 4's last pass to about the time
 its rewrite reaches; on smaller RDNA 3 cards its measurements leave more to gain.
 

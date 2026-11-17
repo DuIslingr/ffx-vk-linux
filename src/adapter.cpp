@@ -43,7 +43,7 @@ __attribute__((ms_abi)) int32_t queryAdapter(QueryAdapterInfo* query) {
 }
 }
 void identifyDriverAdapter(VkPhysicalDevice physical, PFN_vkGetPhysicalDeviceProperties2 query,
-                          VkPhysicalDeviceProperties2* properties) {
+                          VkPhysicalDeviceProperties2* properties, bool liteOwnAdapter) {
     VkPhysicalDeviceIDProperties* id = nullptr;
     for (auto* h = static_cast<VkBaseOutStructure*>(properties->pNext); h; h = h->pNext)
         if (h->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES) id = reinterpret_cast<VkPhysicalDeviceIDProperties*>(h);
@@ -51,6 +51,7 @@ void identifyDriverAdapter(VkPhysicalDevice physical, PFN_vkGetPhysicalDevicePro
     selected = {};
     uint64_t key = 14695981039346656037ull;
     for (auto byte : id->deviceUUID) { key ^= byte; key *= 1099511628211ull; }
+    if (liteOwnAdapter && model() == 1) key ^= 0x4c495445ull << 32;   // ("LITE": a second adapter key for the same GPU)
     // Only the DLL-facing properties receive a Windows-style adapter key.
     if (!id->deviceLUIDValid) {
         std::memcpy(id->deviceLUID, &key, VK_LUID_SIZE);
@@ -82,15 +83,16 @@ void identifyDriverAdapter(VkPhysicalDevice physical, PFN_vkGetPhysicalDevicePro
                 selected.revision = info.chip_external_rev;
                 selected.valid = true;
                 // FSR 4 Lite (an opt-in: FFXVK_FSR4_MODEL=lite, ffxvkFsr4Model): AMD's smaller FSR 4 network. The driver
-                // DLL holds it beside the full models and takes the one for the ASIC family it is told here; it gives
-                // Lite to its integrated GPUs, so the instance of the DLL kept for Lite is told one of those (GC 11.5.0,
-                // the Radeon 890M's) in place of the real family. Only this answer changes: the DLL's Vulkan queries
+                // DLL and the SDK's upscaler DLL each hold it beside the full models and take the one for the ASIC family
+                // they are told here; they give Lite to integrated GPUs, so Lite's questions are answered with one of
+                // those (GC 11.5.0, the Radeon 890M's) in place of the real family: from the instance of the driver DLL
+                // kept for Lite, or under Lite's own adapter key (liteOwnAdapter) from the SDK's DLL. Only this answer changes: the DLL's Vulkan queries
                 // still see the real GPU. On an RX 7900 XTX at 4K, FSR 4 takes 1.39 ms with Lite against 2.31 ms; the
                 // picture is Lite's, not the full model's.
                 if (model() == 1) {
                     selected.family = 150;   // AMDGPU_FAMILY_GC_11_5_0
                     selected.revision = 0x10;
-                    if (std::getenv("FFXVK_DEBUG")) std::fprintf(stderr, "ffx-vk-linux: FSR 4 Lite: family %x revision %x reported to the driver DLL\n", selected.family, selected.revision);
+                    if (std::getenv("FFXVK_DEBUG")) std::fprintf(stderr, "ffx-vk-linux: FSR 4 Lite: family %x revision %x reported\n", selected.family, selected.revision);
                 }
                 if (std::getenv("FFXVK_DEBUG")) std::fprintf(stderr, "ffx-vk-linux: DRM adapter %s family %x revision %x\n", path, selected.family, selected.revision);
             }

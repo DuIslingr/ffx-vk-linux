@@ -56,8 +56,8 @@ UpdateProvider driverProvider() {
 
 __attribute__((ms_abi)) void msProperties2(VkPhysicalDevice device, VkPhysicalDeviceProperties2* properties) {
     r_vkGetPhysicalDeviceProperties2(device, properties);
-    if (!driverProvider()) return;
-    identifyDriverAdapter(device, r_vkGetPhysicalDeviceProperties2, properties);
+    // (for the driver DLL's FSR 4 and for the SDK DLL's own, which asks the same questions when there is no driver DLL)
+    identifyDriverAdapter(device, r_vkGetPhysicalDeviceProperties2, properties, !driverProvider());
 }
 
 // ---- Faster on RADV: memory types and wave size --------------------------------------------------------------------
@@ -285,7 +285,7 @@ __attribute__((ms_abi)) VkResult msCreateImage(VkDevice device, const VkImageCre
 __attribute__((ms_abi)) VkResult msCreateShaderModule(VkDevice device,
         const VkShaderModuleCreateInfo* info, const VkAllocationCallbacks* allocator, VkShaderModule* out) {
     if (!info || !info->pCode || info->codeSize % sizeof(uint32_t)) return VK_ERROR_INVALID_SHADER_NV;
-    auto rewritten = rewriteHalfImageTypes({info->pCode, info->codeSize / sizeof(uint32_t)}, driverProvider() != nullptr);
+    auto rewritten = rewriteHalfImageTypes({info->pCode, info->codeSize / sizeof(uint32_t)}, true);
     if (rewritten.status == ImageRewriteStatus::Invalid) {
         std::fprintf(stderr, "ffx-vk-linux: shader normalization failed: %s\n", rewritten.error.c_str());
         return VK_ERROR_INVALID_SHADER_NV;

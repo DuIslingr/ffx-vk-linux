@@ -30,8 +30,9 @@ __attribute__((visibility("default"))) const char* ffxvkError(void);
 // integrated GPUs: faster, its own picture), NULL or anything else the GPU's own. Contexts keep the model they were made
 // with, so a program can change it while it runs: destroy the context and make it again. Starts as $FFXVK_FSR4_MODEL
 // says (unset: the GPU's own). Call it with no other call into this library running.
-// 0 done, else nonzero and nothing changed - ffxvkError says why (no driver DLL, or it can't be loaded once more:
-// each model has its own instance of amdvkffx64.dll, the second one loaded when first asked for)
+// 0 done, else nonzero and nothing changed - ffxvkError says why (with the driver DLL, each model has its own instance
+// of amdvkffx64.dll, the second one loaded when first asked for, and that load failed; without it, the SDK's
+// amd_fidelityfx_upscaler_vk.dll holds both models and this cannot fail)
 __attribute__((visibility("default"))) int ffxvkFsr4Model(const char* model);
 
 #ifdef __cplusplus

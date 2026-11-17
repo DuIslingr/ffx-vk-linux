@@ -39,7 +39,9 @@ std::mutex loadMutex;
 
 // ---- FSR 4's model (ffxvkFsr4Model): 0 the GPU's own, 1 FSR 4 Lite
 // The driver DLL settles on a model the first time it is asked which GPU it runs on, so each model has its own instance
-// of the DLL (the second one loaded when its model is first asked for), told its own GPU family (adapter.cpp).
+// of the DLL (the second one loaded when its model is first asked for), told its own GPU family (adapter.cpp). Without
+// the driver DLL, the SDK's upscaler DLL supplies FSR 4 itself: it asks which GPU it runs on per adapter key and holds
+// both models, so Lite's questions get an adapter key and a GPU family of their own (adapter.cpp) and one instance serves.
 std::atomic<int> wantedModel{0};
 bool modelChosen = false;        // by ffxvkFsr4Model (else $FFXVK_FSR4_MODEL when the DLLs load)
 std::string driverFile;          // the driver DLL (absolute; empty: none)
@@ -269,9 +271,9 @@ int ffxvkLoad(const char* directory) {
     std::filesystem::path driver = driverPath ? std::filesystem::path(driverPath)
                                             : std::filesystem::path(directory) / "amdvkffx64.dll";
     std::error_code ec;
+    if (!modelChosen) wantedModel = modelNamed(std::getenv("FFXVK_FSR4_MODEL"));
     if (driverPath || std::filesystem::exists(driver, ec)) {
         driverFile = std::filesystem::absolute(driver).string();
-        if (!modelChosen) wantedModel = modelNamed(std::getenv("FFXVK_FSR4_MODEL"));
         if (!loadDriver(wantedModel)) {
             entries = {};
             driverFile.clear();
@@ -286,8 +288,8 @@ const char* ffxvkError(void) { return error.c_str(); }
 int ffxvkFsr4Model(const char* model) {
     std::lock_guard<std::mutex> lock(loadMutex);
     const int m = modelNamed(model);
-    if (entries.createContext) {   // (before the DLLs load: remembered for then)
-        ffxvk::ensureThread();
+    if (entries.createContext && !driverFile.empty()) {   // (before the DLLs load: remembered for then; without the
+        ffxvk::ensureThread();                             // driver DLL, the SDK's DLL holds both models)
         if (!loadDriver(m)) return 1;
     }
     modelChosen = true;

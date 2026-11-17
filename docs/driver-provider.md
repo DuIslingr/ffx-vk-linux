@@ -41,8 +41,8 @@ The shader wrapper promotes nonstandard float16 sampled-image types to float32
 and inserts conversions around image IO so half arithmetic remains half. It uses
 SPIRV-Tools' operand parser to remap IDs without changing numeric literals.
 Malformed modules and unsupported sparse/texel-pointer half-image operations fail
-explicitly. Further driver-specific Vulkan image fixes are applied only while the
-optional driver provider is active.
+explicitly. Further Vulkan image fixes, first made for the driver provider, apply to
+every module (see "The SDK's own FSR 4" below).
 
 Windows thread, event and recursive critical-section services use real pthread
 and Linux synchronization facilities. Unsupported calls retain named traps, so
@@ -99,8 +99,8 @@ storage writes are expanded to four components with alpha 1, and the recurrent
 state image named `rw_recurrent_0` uses a formatless storage-image declaration
 instead of the driver's Rgba32f declaration, allowing the actual UNORM view's
 conversion. The latter adds storage-image read/write-without-format capabilities;
-applications must enable the corresponding Vulkan features. These fixes are
-limited to driver mode. All 30 shader modules captured during the probe also
+applications must enable the corresponding Vulkan features. These fixes were
+limited to driver mode until 17 November 2026 (see below). All 30 shader modules captured during the probe also
 passed standalone Vulkan SPIR-V validation after normalization.
 
 Known limits remain: one device/callback set, the observed driver's legacy
@@ -115,3 +115,40 @@ of a modified executable byte. The SDK-only FSR 3.1.6 path also completed the
 three-frame readback; its Windows shaders emit typed-storage-format validation
 warnings, which this FSR 4 change does not normalize. Missing explicit driver
 paths and `--require-fsr4` without an available FSR 4 provider correctly exit 1.
+
+## The SDK's own FSR 4 (17 November 2026)
+
+SDK 2.4.0's `amd_fidelityfx_upscaler_vk.dll` (SHA-256
+`4a7e895af6e0b615d40a84d59eb8c2b1054ad91cdd0c739567940270d51bdab7`) carries FSR 4
+itself (read from its disassembly with llvm-mingw's objdump; GDB showed the bridge's
+adapter identity was never given without the driver DLL). Its static initializer registers six providers: four FSR 4 ones under the
+driver's version id `f5a5ca1e01001002` (vtables `0x1821acf70` FP8, `0x1821ace40`
+INT8 `FSR4-i8`, `0x1821acec8` RDNA 2 INT8 `FSR4-i8-2`, `0x1821acda0` Lite `FSR4L-i8`),
+then FSR 3.1.6 and 2.3.4. Each FSR 4 provider's support check (vtable slot 2) calls
+one GPU identification routine (`0x18000eb40`). It reads
+`VkPhysicalDeviceIDProperties` and returns false without a valid LUID, caches its
+answer per LUID, and for vendor 0x1002 loads `gdi32.dll` and asks
+`D3DKMTEnumAdapters` / `D3DKMTQueryAdapterInfo` (type 0, 0x260 bytes) for the family
+at offset 48 and the external revision at offset 52, as the driver DLL does. The
+checks then take family 0x91 (any revision 1-0xFE), 0x8F with revision 0x28-0x4F
+(RDNA 2), or 0x96 (Lite for revisions 1-0x3F, the INT8 network for 0xC0-0xCF).
+When the driver's `vkUpdateFfxApiProviderAMD` is available, the SDK asks the driver's
+provider for a version before its own table.
+
+The bridge already answered those questions, but only while the driver DLL was
+loaded: without it the DLL-facing LUID stayed invalid and the SDK listed only FSR 3.
+The adapter identity is now given whenever the DLL asks, and the image fixes above
+apply to every module (FSR 3's 11 modules are unchanged by them). For FSR 4 Lite
+without the driver DLL, Lite's thread model gets a second LUID derived from the same
+UUID, so the DLL's per-LUID cache identifies the GPU again and receives the
+integrated family; one SDK DLL instance serves both models.
+
+Checked on RX 7900 XTX / RADV 26.2.6 with only the two SDK DLLs: `--require-fsr4
+--dispatch --validate` lists 4.1.2 and completes with zero validation errors, and
+its readback is byte-identical to the driver DLL's (full: SHA-256 prefix
+`3b962038eca7`; Lite: `486c03cac9c1`, also identical between the two DLLs). Contexts
+of both models live together, and each made again after the other's destruction,
+give the same images with and without the driver DLL. `ffxasync --fsr 4`, 3840x2160
+Quality with `radv_disable_dcc_stores`, lightest load, serial: 2.576 ms (SDK) and
+2.572 ms (driver) for the full model, 1.657 ms and 1.653 ms for Lite. The FP8
+provider's check and RDNA 2 and integrated GPUs were not run.
